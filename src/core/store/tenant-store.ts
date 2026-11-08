@@ -89,11 +89,17 @@ export function openTenantDb(project: ProjectContext, readOnly = false): DbHandl
     for (const table of TABLES) {
       // A contentless trigram index cannot return its UNINDEXED tenant column. Its rowid is
       // the chunks rowid, so enforce identity through the filtered content table instead.
-      const where = table === "chunks_tri" ? "rowid IN (SELECT rowid FROM chunks)" : filter;
+      // T230: a correlated lookup, not `rowid IN (SELECT rowid FROM chunks)`. That subquery scans every
+      // chunks row of every tenant (the tenant columns are UNINDEXED) on each statement, which took
+      // 8 to 68 s on the 333 MB store; the lookup runs once per trigram match instead.
+      const where = table === "chunks_tri" ? "EXISTS (SELECT 1 FROM chunks WHERE chunks.rowid = main.chunks_tri.rowid)" : filter;
       const hidden = FTS.has(table) ? `rowid,${table},` : "";
       raw.exec(`CREATE TEMP VIEW ${table} AS SELECT ${hidden}* FROM main.${table} WHERE ${where}`);
     }
-    raw.exec(`CREATE TEMP VIEW chunks_vocab AS SELECT v.term,COUNT(DISTINCT v.doc) AS doc,COUNT(*) AS cnt FROM main.chunks_vocab_instances v JOIN chunks c ON c.rowid=v.doc GROUP BY v.term`);
+    // T230: a term is visible when one of its instances sits in a chunk of this tenant. The earlier view grouped
+    // every instance of every tenant, so one lookup of a common term took up to 10 s. doc and cnt are now the
+    // shared index's counts; typo correction uses doc only to order terms at equal edit distance.
+    raw.exec(`CREATE TEMP VIEW chunks_vocab AS SELECT t.term,t.doc,t.cnt FROM main.chunks_vocab t WHERE EXISTS (SELECT 1 FROM main.chunks_vocab_instances v WHERE v.term=t.term AND EXISTS (SELECT 1 FROM chunks c WHERE c.rowid=v.doc))`);
     if (readOnly) raw.exec("PRAGMA query_only=ON");
     const handle = new Proxy(raw, { get(target, key) {
       if (key === "prepare") return (sql: string) => target.prepare(scopedWrite(sql,scope.tenant,project.projectKey));

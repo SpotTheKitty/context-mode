@@ -315,12 +315,17 @@ function typoTerms(db: DbHandle, words: string[]): string[] | null {
   // D-HQ-PERF-2: chunks_vocab has no index on length(term), so each read walks the whole porter vocabulary.
   // One read covers every missing stem's length window; each stem then keeps the rows of its own window
   // (same candidates, same term order as one read per stem).
-  const near = stmt(db.raw, "SELECT term, doc, length(term) AS n FROM chunks_vocab WHERE length(term) BETWEEN ? AND ?");
+  // T230: candidate terms come from the stored vocabulary table, so the length window reads one table and
+  // not a view that probes the tenant's chunks for every term (minutes on the 333 MB store). A candidate
+  // counts only when the scoped view also holds it, so a corrected term is always one this tenant indexed.
+  // The tie-break document count is the shared index's, not the tenant's (see tenant-store.ts chunks_vocab).
+  const near = stmt(db.raw, "SELECT term, length(term) AS n FROM main.chunks_vocab WHERE length(term) BETWEEN ? AND ?");
+  const own = stmt(db.raw, "SELECT doc FROM chunks_vocab WHERE term = ?");
   const stems = queryStems(words.join(" "));
   const miss = stems.map((stem) => has.get(stem) === undefined && [...stem].length >= TYPO_MIN_LEN);
   if (!miss.includes(true)) return null;
   const lens = stems.filter((_, i) => miss[i]).map((stem) => stem.length);
-  const rows = near.all(Math.min(...lens) - TYPO_MAX_DIST, Math.max(...lens) + TYPO_MAX_DIST) as unknown as Array<{ term: string; doc: number; n: number }>;
+  const rows = near.all(Math.min(...lens) - TYPO_MAX_DIST, Math.max(...lens) + TYPO_MAX_DIST) as unknown as Array<{ term: string; n: number }>;
   let changed = false;
   const out: string[] = [];
   stems.forEach((stem, i) => {
@@ -334,8 +339,11 @@ function typoTerms(db: DbHandle, words: string[]): string[] | null {
       if (n < stem.length - TYPO_MAX_DIST || n > stem.length + TYPO_MAX_DIST) continue;
       const d = editDistance(stem, r.term, TYPO_MAX_DIST);
       if (d > TYPO_MAX_DIST) continue;
-      if (best === null || d < best.d || (d === best.d && (r.doc > best.doc || (r.doc === best.doc && r.term < best.term)))) {
-        best = { term: r.term, d, doc: Number(r.doc) };
+      const mine = own.get(r.term) as { doc: number } | undefined;
+      if (mine === undefined) continue;
+      const doc = Number(mine.doc);
+      if (best === null || d < best.d || (d === best.d && (doc > best.doc || (doc === best.doc && r.term < best.term)))) {
+        best = { term: r.term, d, doc };
       }
     }
     if (best !== null) {

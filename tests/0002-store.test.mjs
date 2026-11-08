@@ -1347,6 +1347,107 @@ test('HTTP ctx_index and ctx_search isolate two concurrent tenants in one SQLite
   const raw=new DatabaseSync(join(dataDir,'context.db'));try{assert.equal(raw.prepare('SELECT count(DISTINCT tenant) AS n FROM sources').get().n,2);}finally{raw.close();}
  }finally{await new Promise(r=>host.close(r));rmSync(dataDir,{recursive:true,force:true});}
 });
+// T230: ctx_search is bounded. A slow search must not stop /healthz or other tenants, and one past its budget answers with a timeout result.
+{
+ const base=(dataDir,extra={})=>({host:'127.0.0.1',port:0,path:'/mcp',tenantHeader:'x-context-tenant',dataDir,maxRequestBytes:1000000,tenants:{alpha:{agent:'codex'},beta:{agent:'codex'}},...extra});
+ const rpc=async(port,tenant,name,args,workspace)=>{const res=await fetch(`http://127.0.0.1:${port}/mcp`,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json, text/event-stream','MCP-Protocol-Version':'2025-03-26','x-context-tenant':tenant},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name,arguments:{...args,_workspace:workspace,_sessionId:'t230'}}})});return {status:res.status,body:await res.json()};};
+ const slowOnly=(ms)=>(args)=>JSON.stringify(args).includes('slowmarker')?ms:0;
+ // Longest gap between two ticks of a 20 ms timer in this process: it grows when something holds the event loop.
+ const watchLoop=()=>{let last=performance.now(),worst=0;const timer=setInterval(()=>{const now=performance.now();worst=Math.max(worst,now-last-20);last=now;},20);return ()=>{clearInterval(timer);return worst;};};
+ const stalled=async(config,stall)=>{
+  const dataDir=mkdtempSync(join(tmpdir(),'cm-bound-'));const host=await listenHttp(base(dataDir,config),{searchStall:slowOnly(stall)});const port=host.address().port;
+  return {dataDir,host,port,close:async()=>{host.closeAllConnections();await new Promise(r=>host.close(r));rmSync(dataDir,{recursive:true,force:true});}};
+ };
+ test('T230: /healthz and another tenant answer while a slow search runs',async()=>{
+  const s=await stalled({},2500);const stop=watchLoop();
+  try{
+   await rpc(s.port,'alpha','ctx_index',{content:'alpha slowmarker text',source:'a'},s.dataDir);
+   let done=false;const search=rpc(s.port,'alpha','ctx_search',{queries:['slowmarker']},s.dataDir).then(r=>{done=true;return r;});
+   await new Promise(r=>setTimeout(r,300));
+   const health=[];
+   for(let i=0;i<5;i++){const t=performance.now();const res=await fetch(`http://127.0.0.1:${s.port}/healthz`);assert.equal(await res.text(),'ok');health.push(performance.now()-t);await new Promise(r=>setTimeout(r,100));}
+   const other=performance.now();const indexed=await rpc(s.port,'beta','ctx_index',{content:'beta plain text',source:'b'},s.dataDir);const otherMs=performance.now()-other;
+   assert.equal(done,false,'the slow search is still running');
+   assert.ok(Math.max(...health)<500,'healthz answered in '+Math.max(...health)+' ms');
+   assert.equal(indexed.status,200);assert.ok(!indexed.body.result.isError);assert.ok(otherMs<1000,'other tenant took '+otherMs+' ms');
+   const result=await search;assert.equal(result.status,200);assert.ok(!result.body.result.isError,JSON.stringify(result.body));
+   assert.ok(stop()<1000,'event loop was held');
+  }finally{stop();await s.close();}
+ });
+ test('T230 control: with no search workers the same search holds the event loop',async()=>{
+  const s=await stalled({searchWorkers:0},1500);const stop=watchLoop();
+  try{
+   await rpc(s.port,'alpha','ctx_index',{content:'alpha slowmarker text',source:'a'},s.dataDir);
+   const result=await rpc(s.port,'alpha','ctx_search',{queries:['slowmarker']},s.dataDir);assert.equal(result.status,200);
+   assert.ok(stop()>1000,'the unbounded path should have blocked the loop');
+  }finally{stop();await s.close();}
+ });
+ test('T230: a search over budget returns a timeout result and the server keeps working',async()=>{
+  // A worker thread loads the whole entry on first use, which counts toward the budget: warm both workers, then time out a slow search.
+  const s=await stalled({searchTimeoutMs:2000},8000);
+  try{
+   await rpc(s.port,'alpha','ctx_index',{content:'alpha slowmarker text fastmarker',source:'a'},s.dataDir);
+   await Promise.all([1,2].map(()=>rpc(s.port,'alpha','ctx_search',{queries:['fastmarker']},s.dataDir)));
+   const t=performance.now();const slow=await rpc(s.port,'alpha','ctx_search',{queries:['slowmarker']},s.dataDir);const ms=performance.now()-t;
+   assert.equal(slow.status,200);assert.equal(slow.body.result.isError,true);
+   const text=slow.body.result.content[0].text;assert.match(text,/ctx_search timed out/);assert.match(text,/2000 ms/);assert.match(text,/did not finish/);
+   assert.ok(ms<4000,'timeout reply took '+ms+' ms');
+   const fast=await rpc(s.port,'alpha','ctx_search',{queries:['fastmarker']},s.dataDir);assert.ok(!fast.body.result.isError,JSON.stringify(fast.body));assert.match(JSON.stringify(fast.body.result),/fastmarker/);
+   assert.equal((await fetch(`http://127.0.0.1:${s.port}/healthz`)).status,200);
+  }finally{await s.close();}
+ });
+ test('T230: a worker stuck inside SQLite still counts, and queue wait counts toward the budget',async()=>{
+  // node:sqlite cannot be interrupted, so terminate() waits for the statement: the stub worker runs a ~3 s native statement.
+  const {SearchPool}=await import('../src/entries/search-pool.ts');
+  const dir=mkdtempSync(join(tmpdir(),'cm-pool-'));const stub=join(dir,'stub.mjs');
+  writeFileSync(stub,"import {parentPort} from 'node:worker_threads';import {DatabaseSync} from 'node:sqlite';parentPort.on('message',m=>{new DatabaseSync(':memory:').prepare('WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<30000000) SELECT count(*) AS n FROM c').get();parentPort.postMessage({id:m.id,error:'finished'});});");
+  const pool=new SearchPool(stub,1);
+  try{
+   const first=pool.run({},500);
+   await new Promise(r=>setTimeout(r,100));
+   const t=performance.now();const queued=await pool.run({},500);const waited=performance.now()-t;
+   assert.deepEqual(await first,{kind:'timeout',started:true});
+   assert.deepEqual(queued,{kind:'timeout',started:false});
+   assert.ok(waited>=350&&waited<1500,'queued search answered after '+waited+' ms');
+  }finally{await pool.close();rmSync(dir,{recursive:true,force:true});}
+ });
+ test('T230: the bundled server runs bounded searches from a flat directory',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'cm-flat-search-'));let child;
+  try{
+   await build({absWorkingDir:fileURLToPath(new URL('..',import.meta.url)),entryPoints:['src/entries/server-http.ts'],outfile:join(dir,'server-http.mjs'),bundle:true,platform:'node',format:'esm',target:'node24',external:['node:*'],banner:{js:'import {createRequire as __cmCreateRequire} from "node:module"; const require=__cmCreateRequire(import.meta.url);'}});
+   const table=join(dir,'endpoints.json');writeFileSync(table,JSON.stringify({contextMode:base(join(dir,'data'),{port:0,tenants:{alpha:{agent:'codex'}}})}));
+   child=spawn(process.execPath,[join(dir,'server-http.mjs'),table],{cwd:dir,stdio:['ignore','ignore','pipe'],windowsHide:true});
+   const ready=await new Promise((resolve,reject)=>{let text='';const timer=setTimeout(()=>reject(new Error('flat entry did not listen: '+text)),30000);child.on('exit',code=>{clearTimeout(timer);reject(new Error('entry exited '+code+': '+text))});child.stderr.on('data',data=>{text+=data;for(const line of text.split('\n')){try{const row=JSON.parse(line);if(row.event==='listening'){clearTimeout(timer);resolve(row);return;}}catch{}}});});
+   const port=ready.address.port;
+   assert.ok(!(await rpc(port,'alpha','ctx_index',{content:'flat bundle searchable text',source:'flat'},dir)).body.result.isError);
+   const found=await rpc(port,'alpha','ctx_search',{queries:['searchable']},dir);assert.ok(!found.body.result.isError,JSON.stringify(found.body));assert.match(JSON.stringify(found.body.result),/searchable/);
+  }finally{if(child){child.kill();await new Promise(r=>child.once('exit',r));}rmSync(dir,{recursive:true,force:true});}
+ });
+ test('T230: typo correction offers only terms the tenant indexed',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'cm-typo-'));const database=join(dir,'context.db');
+  const project={projectKey:'one',projectDir:dir,dbPath:database,worktree:dir,containmentRoot:dir,agent:'codex',source:'spawn-cwd'};
+  const scoped=(tenant,fn)=>httpScope.run({tenant,database},async()=>{const db=await openDb(project);try{return await fn(db)}finally{closeDb(db)}});
+  try{
+   for(const [tenant,word] of [['alpha','quartzine'],['beta','quartzite']]) await scoped(tenant,db=>ftsInsert(db,{sessionId:'s',worktree:dir,agent:'codex',kind:'content',label:tenant,bytes:20,createdAt:Date.now()},[{ord:0,text:word+' sample text',bytes:20}]));
+   const hits=(tenant)=>scoped(tenant,db=>ftsQuery(db,'quartzise','project',project,'s',10,0).map(h=>h.label));
+   assert.deepEqual(await hits('alpha'),['alpha']);assert.deepEqual(await hits('beta'),['beta']);
+  }finally{rmSync(dir,{recursive:true,force:true});}
+ });
+ test('T230: the trigram statement reads rows in proportion to the tenant, not the whole store',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'cm-vm-'));const database=join(dir,'context.db');
+  const project={projectKey:'one',projectDir:dir,dbPath:database,worktree:dir,containmentRoot:dir,agent:'codex',source:'spawn-cwd'};
+  const scoped=(tenant,fn)=>httpScope.run({tenant,database},async()=>{const db=await openDb(project);try{return await fn(db)}finally{closeDb(db)}});
+  try{
+   for(const tenant of ['alpha','beta']) await scoped(tenant,db=>{for(let i=0;i<400;i++) ftsInsert(db,{sessionId:'s',worktree:dir,agent:'codex',kind:'content',label:tenant+i,bytes:40,createdAt:Date.now()},[{ord:0,text:(tenant==='alpha'&&i<5?'searchterm ':'')+tenant+' filler number '+i,bytes:40}]);});
+   await scoped('alpha',db=>{
+    const st=db.raw.prepare('SELECT t.rowid AS rid FROM chunks_tri t JOIN chunks c ON c.rowid = t.rowid WHERE chunks_tri MATCH :m');
+    const rows=st.all({m:'"searchterm"'});assert.equal(rows.length,5);
+    // One scan of both tenants' 800 chunks per statement was the shape that took 8 to 68 s on the 333 MB store.
+    assert.ok(st.stat('vmStep')<1500,'vmStep '+st.stat('vmStep'));
+   });
+  }finally{rmSync(dir,{recursive:true,force:true});}
+ });
+}
 const {forwardHook}=await import('../src/entries/hook-http.ts');
 test('HTTP native hooks index into the tenant store and fail open on transport failure',async()=>{
  const dataDir=mkdtempSync(join(tmpdir(),'cm-http-hooks-'));

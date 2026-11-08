@@ -1,8 +1,9 @@
 import { createServer as createHttpServer, type Server } from "node:http";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { isMainThread, workerData } from "node:worker_threads";
 import { McpServer, WebStandardStreamableHTTPServerTransport, type StandardSchemaWithJSON } from "@modelcontextprotocol/server";
 import { z } from "zod/v4";
 import { TOOLS } from "../core/tools/registry.ts";
@@ -11,12 +12,33 @@ import { handleHook } from "../core/hooks/dispatch.ts";
 import { appendEvent, ownCallRow } from "../core/journal/append.ts";
 import { closeDb, openDb } from "../core/store/db.ts";
 import { httpScope, settleHttpScope } from "../core/store/http-scope.ts";
-import type { AgentId, ToolContext } from "../core/contracts/types.ts";
+import type { AgentId, ToolContext, ToolReply } from "../core/contracts/types.ts";
 import { DB_FILE_NAME } from "../core/contracts/constants.ts";
+import { SEARCH_WORKER_ROLE, SearchPool } from "./search-pool.ts";
+import { serveSearchWorker, stallSync } from "./search-worker.ts";
 
 export interface HttpConfig {
   host: string; port: number; path: string; tenantHeader: string; dataDir: string;
   maxRequestBytes: number; tenants: Record<string, {agent: AgentId; toolPrefix?: string; hookAdapters?: Record<string,{toolPrefix?:string}>}>;
+  /** T230: budget for one ctx_search, queue wait included. Default SEARCH_TIMEOUT_MS. */
+  searchTimeoutMs?: number;
+  /** T230: worker threads that run searches. Default SEARCH_WORKERS; 0 runs a search on the request path (no bound). */
+  searchWorkers?: number;
+}
+/** Test seam: `searchStall` returns how long to block the thread that runs a search before it starts, as a long SQLite statement would. */
+export interface HttpOptions { searchStall?: (args: unknown) => number; }
+
+export const SEARCH_TIMEOUT_MS = 20000;
+export const SEARCH_WORKERS = 2;
+const BOUNDED_TOOLS = new Set(["ctx_search"]);
+
+function timeoutReply(tool: string, ms: number, started: boolean): ToolReply {
+  const why = started ? "did not finish within" : "waited for a free search worker for";
+  return {
+    text: `${tool} timed out: it ${why} ${ms} ms (searchTimeoutMs). The server is still answering other requests. Narrow the search with source or scope, use fewer or more specific words, or retry.`,
+    isError: true,
+    sandboxBytes: 0,
+  };
 }
 
 // Only environment names needed by project resolution and sandbox execution. Never copy the
@@ -29,10 +51,15 @@ function environment(config: HttpConfig): NodeJS.ProcessEnv {
   return env;
 }
 
-export async function listenHttp(config: HttpConfig): Promise<Server> {
+export async function listenHttp(config: HttpConfig, options: HttpOptions = {}): Promise<Server> {
   if (!config.tenantHeader || !config.dataDir || !config.path || !config.maxRequestBytes) throw new Error("incomplete contextMode table");
   const database = join(config.dataDir,DB_FILE_NAME);
   const env = environment(config);
+  const searchTimeoutMs = config.searchTimeoutMs ?? SEARCH_TIMEOUT_MS;
+  const searchWorkers = config.searchWorkers ?? SEARCH_WORKERS;
+  if (!(searchTimeoutMs > 0) || !Number.isInteger(searchWorkers) || searchWorkers < 0) throw new Error("invalid contextMode searchTimeoutMs or searchWorkers");
+  // Workers load this same file (the flat bundle has no other), so the entry is our own URL.
+  const pool = searchWorkers > 0 ? new SearchPool(fileURLToPath(import.meta.url), searchWorkers) : null;
   const host = createHttpServer(async (incoming,outgoing) => {
     try {
       const url = new URL(incoming.url ?? "/", `http://${config.host}`);
@@ -80,9 +107,21 @@ export async function listenHttp(config: HttpConfig): Promise<Server> {
             delete args._workspace; delete args._sessionId;
             try {
               if (typeof workspace !== "string") throw new Error("HTTP context-mode requires _workspace or workspace metadata");
-              const project = resolveProject(agent,{env,argv:["--agent",agent,"--workspace-folder",workspace],cwd:workspace,piCwd:workspace});
+              const source = {env,argv:["--agent",agent,"--workspace-folder",workspace],cwd:workspace,piCwd:workspace};
+              const project = resolveProject(agent,source);
               const ctx: ToolContext = {project,sessionId,turn:0,signal:req.mcpReq.signal,protocolVersion:server.server.getNegotiatedProtocolVersion() ?? ""};
-              const reply = await tool.handler(tool.schema.parse(args),ctx);
+              const input = tool.schema.parse(args);
+              let reply: ToolReply;
+              const stallMs = BOUNDED_TOOLS.has(tool.name) ? options.searchStall?.(input) ?? 0 : 0;
+              if (pool && BOUNDED_TOOLS.has(tool.name)) {
+                const scope = httpScope.getStore()!;
+                const out = await pool.run({tool:tool.name,args:input,tenant:scope.tenant,database:scope.database,toolPrefix:scope.toolPrefix,agent,source,sessionId,protocolVersion:ctx.protocolVersion,stallMs},searchTimeoutMs);
+                if (out.kind === "failed") throw new Error(out.message);
+                reply = out.kind === "timeout" ? timeoutReply(tool.name,searchTimeoutMs,out.started) : out.reply;
+              } else {
+                stallSync(stallMs);
+                reply = await tool.handler(input,ctx);
+              }
               const db = await openDb(project);
               try {appendEvent(db,ownCallRow(project,ctx,tool.name,reply));} finally {closeDb(db);}
               return {content:[{type:"text" as const,text:reply.text}],isError:reply.isError};
@@ -103,10 +142,14 @@ export async function listenHttp(config: HttpConfig): Promise<Server> {
     } catch (e) {console.error("context-mode HTTP request failed", e); if (!outgoing.headersSent) outgoing.writeHead(500); outgoing.end("request failed");}
   });
   await new Promise<void>((resolve,reject)=>{host.once("error",reject);host.listen(config.port,config.host,()=>{host.off("error",reject);resolve();});});
+  host.once("close",() => {void pool?.close();});
   return host;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// A search worker is this same file started as a thread: it must not read argv (copied from the parent) and listen.
+if (!isMainThread && (workerData as {role?: string} | null)?.role === SEARCH_WORKER_ROLE) {
+  serveSearchWorker();
+} else if (isMainThread && process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const config = JSON.parse(readFileSync(process.argv[2]!,"utf8")).contextMode as HttpConfig;
   const host = await listenHttp(config);
   console.error(JSON.stringify({event:"listening",pid:process.pid,parentPid:process.ppid,address:host.address(),instance:randomUUID()}));
