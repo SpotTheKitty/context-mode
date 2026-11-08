@@ -1,7 +1,7 @@
 // Offline, one-time import. Sources are read-only snapshots; no file synchronization.
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { migrateTenantStore } from '../core/store/tenant-store.ts';
@@ -14,6 +14,17 @@ interface ImportConfig { dataDir: string; tenants: Record<string, unknown>; impo
 const hash = (s: string): string => createHash('sha256').update(s).digest('hex');
 const safeJson = (row: Row): string => JSON.stringify(row);
 const text = (v: unknown): string => v === null || v === undefined ? '' : String(v);
+
+/** Fold historical Windows spellings, then use the nearest directory still on disk. */
+export function legacyWorkspace(workspace: string): string {
+  let path=workspace.replaceAll('\\','/').replace(/^\/\/[^/]+\/([a-z])\$?(?:\/|$)/i,(_,drive:string)=>drive+':/').replace(/^\/([a-z])(?:\/|$)/i,(_,drive:string)=>drive+':/');
+  const worktree=/^C:\/Users\/[^/]+\/\.t3\/worktrees\/([^/]+)(?:\/|$)/i.exec(path);
+  if(worktree && existsSync('F:/Projects/'+worktree[1])) path='F:/Projects/'+worktree[1];
+  path=resolve(path);
+  while((!existsSync(path) || !statSync(path).isDirectory()) && dirname(path)!==path) path=dirname(path);
+  return realpathSync.native(path);
+}
+export const legacyProjectKey=(tenant:string):string=>hash(tenant+':legacy').slice(0,16);
 
 /** Only explicit configured roots are walked, without following links or opening other file types. */
 export function discoverDatabases(root: string): string[] {
@@ -44,15 +55,20 @@ export function importDatabase(sourcePath: string, source: ImportSource, config:
     const names=modern?['events','sources','chunks','line_units','meta']:['session_events','session_meta','session_resume','tool_calls','sources','chunks','vocabulary'];
     const rows=new Map<string,Row[]>();
     for(const name of names) if(tables.has(name)) rows.set(name,input.prepare(`SELECT rowid AS _import_rowid,* FROM ${name}`).all() as Row[]);
-    const sessions=new Map((rows.get('session_meta')??[]).map(r=>[text(r.session_id),text(r.project_dir)]));
+    const sessions=new Map<string,string>();
+    for(const name of ['session_meta','session_resume','sources']) for(const row of rows.get(name)??[]) {
+      const workspace=text(row.worktree || row.project_dir);
+      if(workspace) sessions.set(text(row.session_id),workspace);
+    }
+    const databaseWorkspaces=new Set(sessions.values());
     const projects=new Map<Row,string>();
     for(const records of rows.values()) for(const row of records) {
       let key=source.projectKey;
-      const workspace=source.workspace || text(row.worktree || row.project_dir) || sessions.get(text(row.session_id));
+      const workspace=source.workspace || text(row.worktree || row.project_dir) || sessions.get(text(row.session_id)) || (databaseWorkspaces.size===1?[...databaseWorkspaces][0]:undefined);
       if(!key && workspace) {
         const mapped=config.importProjectMappings?.[workspace] ?? workspace;
-        try {key=resolveProject('codex',{env:{},argv:[],cwd:mapped}).projectKey;}
-        catch {throw new Error('Import workspace needs an explicit mapping: '+workspace);}
+        try {key=resolveProject('codex',{env:{},argv:[],cwd:legacyWorkspace(mapped)}).projectKey;}
+        catch {key=legacyProjectKey(source.tenant);}
       }
       if(!key && modern && /^[a-f0-9]{16}$/.test(dirname(canonical).split(/[\\/]/).at(-1)??'')) key=dirname(canonical).split(/[\\/]/).at(-1);
       // Meta and legacy content tables have no workspace; a single unambiguous source identity is required.
@@ -60,9 +76,9 @@ export function importDatabase(sourcePath: string, source: ImportSource, config:
     }
     const known=new Set(projects.values());
     for(const records of rows.values()) for(const row of records) if(!projects.has(row)) {
-      if(known.size!==1) throw new Error('Database needs an explicit workspace/projectKey: '+canonical);
-      projects.set(row,[...known][0] as string);
+      projects.set(row,known.size===1?[...known][0] as string:legacyProjectKey(source.tenant));
     }
+    for(const key of projects.values()) known.add(key);
     const digest=hash(JSON.stringify([...rows]));
     const marker='import:'+hash(canonical.toLowerCase());
     const count=[...rows.values()].reduce((n,r)=>n+r.length,0);

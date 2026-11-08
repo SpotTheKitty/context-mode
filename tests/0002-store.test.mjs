@@ -1289,11 +1289,11 @@ test('one-time legacy and current imports preserve sources and isolate HTTP sear
  }finally{if(host)await new Promise(r=>host.close(r));rmSync(dir,{recursive:true,force:true});}
 });
 
-test('import rolls back orphan content and requires mappings for unavailable workspaces',()=>{
+test('import rolls back orphan content and resolves unavailable workspaces',()=>{
  const dir=mkdtempSync(join(tmpdir(),'cm-import-failure-'));const path=join(dir,'legacy.db');const db=new DatabaseSync(path);db.exec("CREATE TABLE sources(id INTEGER PRIMARY KEY,label TEXT);CREATE VIRTUAL TABLE chunks USING fts5(content,source_id UNINDEXED,title);INSERT INTO sources VALUES(1,'old');INSERT INTO chunks VALUES('orphan',2,'title');");db.close();
  const config={dataDir:join(dir,'shared'),tenants:{alpha:{}},imports:[]};
  try{
-  assert.throws(()=>importDatabase(path,{tenant:'alpha',root:dir,workspace:join(dir,'deleted')},config),/explicit mapping/);assert.equal(existsSync(config.dataDir),false);
+  assert.equal(importDatabase(path,{tenant:'alpha',root:dir,workspace:join(dir,'deleted')},config).rows,2);assert.equal(existsSync(config.dataDir),false);
   assert.throws(()=>importDatabase(path,{tenant:'alpha',root:dir,workspace:dir},config,true),/Orphan chunk/);
   const raw=new DatabaseSync(join(config.dataDir,'context.db'));try{for(const table of ['sources','chunks','legacy_records','meta'])assert.equal(raw.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n,0);}finally{raw.close();}
  }finally{rmSync(dir,{recursive:true,force:true});}
@@ -1348,7 +1348,7 @@ test('HTTP ctx_index and ctx_search isolate two concurrent tenants in one SQLite
  }finally{await new Promise(r=>host.close(r));rmSync(dataDir,{recursive:true,force:true});}
 });
 const {forwardHook}=await import('../src/entries/hook-http.ts');
-test('HTTP native hooks index into the tenant store and retain upstream failure policy',async()=>{
+test('HTTP native hooks index into the tenant store and fail open on transport failure',async()=>{
  const dataDir=mkdtempSync(join(tmpdir(),'cm-http-hooks-'));
  const config={host:'127.0.0.1',port:0,path:'/mcp',tenantHeader:'x-context-tenant',dataDir,maxRequestBytes:1000000,hookTimeoutMs:5000,tenants:{alpha:{agent:'claude-code',toolPrefix:'mcp__contextMode__'},beta:{agent:'claude-code',toolPrefix:'mcp__contextMode__'}}};
  const host=await listenHttp(config);config.port=host.address().port;let closed=false;
@@ -1360,7 +1360,7 @@ test('HTTP native hooks index into the tenant store and retain upstream failure 
   const db=new DatabaseSync(join(dataDir,'context.db'));try{assert.deepEqual(db.prepare('SELECT DISTINCT tenant FROM events ORDER BY tenant').all().map(r=>r.tenant),['alpha','beta']);assert.equal(db.prepare('SELECT COUNT(DISTINCT tenant) AS n FROM sources').get().n,2);}finally{db.close();}
   await new Promise(r=>host.close(r));closed=true;
   const fallback=await forwardHook(config,'alpha',{session_id:'hook-shared',cwd:dataDir,hook_event_name:'PreToolUse',tool_name:'Bash',tool_input:{command:'curl https://example.com'}});
-  assert.equal(fallback.exitCode,0);assert.match(fallback.stdout,/mcp__contextMode__ctx_execute/);assert.match(fallback.stderr,/upstream failure policy/);
+  assert.equal(fallback.exitCode,0);assert.equal(fallback.stdout,'');assert.match(fallback.stderr,/allowed/);
  }finally{if(!closed)await new Promise(r=>host.close(r));rmSync(dataDir,{recursive:true,force:true});}
 });
 

@@ -2,11 +2,11 @@
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { getAdapter } from "../adapters/table.ts";
-import { failureOutput } from "../core/hooks/fallback.ts";
+import { logHookError } from "../core/hooks/fallback.ts";
 import type { AgentId, HookOutput } from "../core/contracts/types.ts";
 
 export interface HookHttpConfig {
-  host: string; port: number; path: string; tenantHeader: string; hookTimeoutMs: number;
+  dataDir: string; host: string; port: number; path: string; tenantHeader: string; hookTimeoutMs: number;
   tenants: Record<string,{agent:AgentId;toolPrefix?:string;hookAdapters?:Record<string,{toolPrefix?:string}>}>;
 }
 
@@ -15,7 +15,6 @@ export async function forwardHook(config: HookHttpConfig, tenant: string, raw: u
   if (!identity || !config.tenantHeader || !(config.hookTimeoutMs > 0)) throw new Error("invalid HTTP hook configuration");
   const agent = adapter ?? identity.agent;
   if (agent !== identity.agent && !Object.hasOwn(identity.hookAdapters ?? {},agent)) throw new Error("unknown HTTP hook adapter");
-  const toolPrefix = identity.hookAdapters?.[agent]?.toolPrefix ?? identity.toolPrefix;
   try {
     const response = await fetch(`http://${config.host}:${config.port}${config.path}/hooks`,{
       method:"POST",headers:{"Content-Type":"application/json",[config.tenantHeader]:tenant},
@@ -26,11 +25,12 @@ export async function forwardHook(config: HookHttpConfig, tenant: string, raw: u
     if (typeof out.stdout !== "string" || (out.exitCode !== 0 && out.exitCode !== 2) || (out.stderr !== undefined && typeof out.stderr !== "string")) throw new Error("invalid native hook response");
     return out;
   } catch (err) {
-    // Reuse upstream's existing failure policy rather than inventing a local allow path.
-    const out = failureOutput(agent,raw,err);
-    const oldPrefix = getAdapter(agent).toolNamePrefix;
-    return {...out,stdout:toolPrefix && oldPrefix ? out.stdout.replaceAll(oldPrefix,toolPrefix) : out.stdout,
-      stderr:"context-mode HTTP hook unavailable; upstream failure policy applied"};
+    logHookError({CONTEXT_MODE_DATA_DIR:config.dataDir},agent,"http",err);
+    const row = getAdapter(agent);
+    let event: ReturnType<typeof row.decode>["event"] = "PreToolUse";
+    try {event=row.decode(raw).event;} catch { /* Empty allow also permits malformed native inputs. */ }
+    return {...row.encode({event,agent,sessionId:"",cwd:"",turn:0},{kind:"allow"}),
+      stderr:"context-mode HTTP hook unavailable; allowed"};
   }
 }
 
