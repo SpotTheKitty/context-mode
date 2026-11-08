@@ -18,6 +18,11 @@ import { composeMatcher } from "../src/core/ops/doctor-config.ts";
 import { denyMessage } from "../src/core/policy/decide.ts";
 import { buildRegistry, renderSkill } from "../src/setup/registry.ts";
 
+// Shared by both npm package and native-manifest fixture blocks.
+const runNpm = (args, options) => process.platform === "win32"
+  ? spawnSync(process.execPath, [path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"), ...args], options)
+  : spawnSync("npm", args, options);
+
 // Sections are independent: each builds into its own temp dir and none changes process.env or the cwd, so they run concurrently.
 describe("ADR-0018 / ADR-0019 / ADR-0023 build, generated files, host manifests, npm package", { concurrency: CONC }, () => {
 describe("ADR-0018 build: release-out tree", () => {
@@ -822,9 +827,7 @@ describe("ADR-0019 build: npm package", () => {
   const DEV = JSON.parse(readFileSync(path.join(REPO, "package.json"), "utf8")); // D-PKG-META-1: shared fields come from here
   const FIXTURE = JSON.parse(readFileSync(path.join(REPO, "e2e", "fixtures", "hook-roundtrip.json"), "utf8"));
   const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
-  const runNpm = (args, options) => process.platform === "win32"
-    ? spawnSync(process.execPath, [path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"), ...args], options)
-    : spawnSync(NPM, args, options);
+
   let out;
   let scratch;
 
