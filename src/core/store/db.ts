@@ -19,6 +19,8 @@ import { CtxError } from "../contracts/errors.ts";
 import type { DbHandle, ProjectContext } from "../contracts/types.ts";
 import { applyMigrations } from "./schema.ts";
 import { openReadOnlyHandle } from "./open-read.ts";
+import { httpScope } from "./http-scope.ts";
+import { openTenantDb } from "./tenant-store.ts";
 
 export type { DbHandle } from "../contracts/types.ts";
 
@@ -115,6 +117,13 @@ function openReadOnly(sqlite: SqliteModule, path: string): DatabaseSync {
 }
 
 export async function openDb(project: ProjectContext, opts?: { readOnly?: boolean }): Promise<DbHandle> {
+  if (httpScope.getStore()) {
+    const scope = httpScope.getStore()!;
+    const opening = Promise.resolve().then(() => openTenantDb(project, opts?.readOnly === true));
+    scope.pending ??= new Set();
+    scope.pending.add(opening);
+    try {return await opening;} finally {scope.pending.delete(opening);}
+  }
   // Step 1: Node version gate.
   if (isBelow(process.version, NODE_MIN)) throw new CtxError("NODE_TOO_OLD", { v: process.version });
   const sqlite = await loadSqlite();
