@@ -12,10 +12,11 @@ import { appendEvent, ownCallRow } from "../core/journal/append.ts";
 import { closeDb, openDb } from "../core/store/db.ts";
 import { httpScope, settleHttpScope } from "../core/store/http-scope.ts";
 import type { AgentId, ToolContext } from "../core/contracts/types.ts";
+import { DB_FILE_NAME } from "../core/contracts/constants.ts";
 
 export interface HttpConfig {
   host: string; port: number; path: string; tenantHeader: string; dataDir: string;
-  maxRequestBytes: number; tenants: Record<string, {agent: AgentId}>;
+  maxRequestBytes: number; tenants: Record<string, {agent: AgentId; toolPrefix?: string; hookAdapters?: Record<string,{toolPrefix?:string}>}>;
 }
 
 // Only environment names needed by project resolution and sandbox execution. Never copy the
@@ -30,7 +31,7 @@ function environment(config: HttpConfig): NodeJS.ProcessEnv {
 
 export async function listenHttp(config: HttpConfig): Promise<Server> {
   if (!config.tenantHeader || !config.dataDir || !config.path || !config.maxRequestBytes) throw new Error("incomplete contextMode table");
-  const database = join(config.dataDir,"context.db");
+  const database = join(config.dataDir,DB_FILE_NAME);
   const env = environment(config);
   const host = createHttpServer(async (incoming,outgoing) => {
     try {
@@ -40,7 +41,7 @@ export async function listenHttp(config: HttpConfig): Promise<Server> {
       const tenant = incoming.headers[config.tenantHeader.toLowerCase()];
       if (typeof tenant !== "string" || !Object.hasOwn(config.tenants,tenant)) {outgoing.writeHead(403).end("unknown tenant"); return;}
       const agent = config.tenants[tenant]!.agent;
-      await httpScope.run({tenant,database},async () => {
+      await httpScope.run({tenant,database,toolPrefix:config.tenants[tenant]!.toolPrefix},async () => {
         const chunks: Buffer[] = []; let bytes=0;
         for await (const chunk of incoming) {
           bytes += chunk.length;
@@ -50,9 +51,16 @@ export async function listenHttp(config: HttpConfig): Promise<Server> {
         const body = Buffer.concat(chunks).toString("utf8");
         if (url.pathname.endsWith("/hooks")) {
           if (incoming.method !== "POST") {outgoing.writeHead(405).end(); return;}
-          const raw: unknown = JSON.parse(body);
+          const input = JSON.parse(body) as Record<string,unknown>;
+          const wrapped = typeof input.adapter === "string" && Object.hasOwn(input,"raw");
+          const adapter = wrapped ? input.adapter as AgentId : agent;
+          const adapters = config.tenants[tenant]!.hookAdapters;
+          if (adapter !== agent && !Object.hasOwn(adapters ?? {},adapter)) {outgoing.writeHead(403).end("unknown hook adapter");return;}
+          const scope = httpScope.getStore()!;
+          scope.toolPrefix = adapters?.[adapter]?.toolPrefix ?? config.tenants[tenant]!.toolPrefix;
+          const raw: unknown = wrapped ? input.raw : input;
           let answer;
-          try {answer = await handleHook(agent,raw,env);} finally {await settleHttpScope();}
+          try {answer = await handleHook(adapter,raw,env);} finally {await settleHttpScope();}
           outgoing.setHeader("Content-Type","application/json"); outgoing.end(JSON.stringify(answer)); return;
         }
         const server = new McpServer({name:"context-mode",version:"tenant-http"});

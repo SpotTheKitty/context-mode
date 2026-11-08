@@ -1517,6 +1517,7 @@ describe("ADR-0008 privacy: network call sites in src (D-PRIVACY-NET-1)", { conc
   // file -> markers it may hold, and why.
   const ALLOWED = {
     "src/entries/server-http.ts": ["node:http"], // optional local HTTP listener; tenant-scoped requests, no outbound calls
+    "src/entries/hook-http.ts": ["fetch("], // native hook posts only to the configured workstation HTTP endpoint
     "src/cli/commands.ts": ['spawnSync("gh"', "spawnSync(npm"], // gh issue create after a keypress (debug report); npm i -g in `context-mode upgrade`
     "src/core/contracts/constants.ts": ["fetch(", "GIT_LS_REMOTE", "GIT_CLONE_ARGS"], // the constants themselves (FETCH_CALL is a deny pattern)
     "src/core/ops/doctor-env.ts": ["fetch(", "GIT_LS_REMOTE"], // doctor D1: GET registry.npmjs.org/-/package/context-mode/dist-tags; after an npm failure, git ls-remote --tags --refs <release repo> v* (D-DOCTOR-D1-TAGS-1)

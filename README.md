@@ -1,29 +1,5 @@
 # Context Mode
 
-## Workstation tenant HTTP fork
-
-This fork retains the upstream stdio entry and adds an optional local Streamable HTTP
-entry. `src/entries/server-http.ts` imports `node:http` only to accept requests; it adds
-no outbound network call or telemetry. Build with `node build/build-http.mjs <output>`
-after `node build/build.mjs --generated-only`, then run
-`node <output>/server-http.mjs <workstation-mcp-endpoints.json>`.
-
-The table's `contextMode` block defines the bind address, port, MCP path, tenant header,
-tenant-to-adapter mapping, request size limit, and shared data directory. Unknown or
-missing tenant headers are rejected. HTTP tools accept `_workspace` and `_sessionId`
-(or equivalent request metadata); workspace identity is resolved on every call.
-`POST <MCP path>/hooks` accepts the adapter's native hook payload and returns its
-encoded stdout, stderr, and exit code. The HTTP entry omits machine-wide doctor/upgrade
-operations; those remain available over stdio.
-
-HTTP uses one `context.db`, with tenant and project columns on stored events, sources,
-metadata, and FTS content. Per-connection filtered views scope reads, including trigram
-and vocabulary lookups; the write boundary injects tenant/project identity and rejects
-unsupported write shapes. SQLite shadow/index tables are derived from that content.
-`migrateTenantStore(db, tenant, projectKey)` tags legacy rows transactionally on a staged
-database. Never point the HTTP entry at a legacy stdio database as an implicit import.
-
-
 **A free, local plugin for 10 coding agents. It keeps tool output out of your agent's context window and keeps all usage data on your machine. The plugin is free forever.**
 
 [![npm downloads](https://img.shields.io/npm/dt/context-mode?label=npm%20downloads)](https://www.npmjs.com/package/context-mode) [![GitHub stars](https://img.shields.io/github/stars/mksglu/context-mode?style=flat&color=yellow)](https://github.com/mksglu/context-mode) [![Discord](https://img.shields.io/discord/1478479412700909750?label=Discord&logo=discord&color=5865f2)](https://discord.gg/DCN9jUgN5v) [![License: ELv2](https://img.shields.io/badge/License-ELv2-blue.svg)](LICENSE)
@@ -588,6 +564,8 @@ Full reference: [Tools](https://contextmode.ai/docs/engine/tools?utm_source=gith
 Commands in the agent: `/ctx-stats` shows the `ctx_stats` result, `/ctx-doctor` runs `ctx_doctor` (send its report with a defect report), and `/ctx-upgrade` runs `ctx_upgrade`, then `ctx_doctor`.
 
 ## Security and privacy
+
+The plugin accepts local Streamable HTTP requests in `src/entries/server-http.ts` and posts native hooks to the configured workstation endpoint in `src/entries/hook-http.ts`. Tenant/project-scoped SQLite storage and build details are in [the workstation HTTP guide](docs/architecture/TENANT-HTTP.md).
 
 - The plugin keeps all its data on your machine, one database per project in `~/.context-mode`, and `ctx_purge` deletes it by session, source or project. Read the [Security guide](https://contextmode.ai/docs/engine/security?utm_source=github&utm_medium=readme&utm_content=security).
 - The plugin has zero telemetry: usage data, events and crash reports stay on your machine. It uses the network for four calls, each one started by you or your agent:

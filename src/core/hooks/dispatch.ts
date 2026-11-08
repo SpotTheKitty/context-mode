@@ -4,6 +4,7 @@
 // D-CI-PERF-7: node:fs through getBuiltinModule; a static ESM import of node:fs also loads fs/promises, readline and streams.
 const { lstatSync, readFileSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { httpScope } from "../store/http-scope.ts";
 import { AGENT_IDS, type AgentId } from "../contracts/agents.ts";
 import {
   COMPACTED_META_PREFIX, COMPACT_POINTER_LINE, COMPACT_STATE_KEY, DECISION_OPTION_KEY, DECISION_SOURCE, DECISION_TOOL, EDIT_PATH_KEYS, EDIT_TOOLS, EXIT_CODE_LINE_PREFIX,
@@ -68,12 +69,15 @@ export async function handleHook(agent: AgentId, raw: unknown, env: NodeJS.Proce
     process.stderr.write("hooks: unknown agent " + JSON.stringify(agent) + "\n"); // step 1, A22, D-FU-PS-1
     return EMPTY;
   }
-  const row = getAdapter(agent);
+  const base = getAdapter(agent);
+  const prefix = httpScope.getStore()?.toolPrefix;
+  const row = prefix ? {...base,toolNamePrefix:prefix} : base;
   // D-HNE-GUARD-1: every failure below ends in failureOutput (exit 0, this host's shape, tool table only) and a log line.
   const fail = (stage: string, err: unknown, line?: string): HookOutput => {
     logHookError(env, agent, stage, err);
     process.stderr.write(line ?? "hooks: " + stage + " failed: " + message(err) + "\n");
-    return failureOutput(agent, raw, err);
+    const out = failureOutput(agent, raw, err);
+    return prefix && base.toolNamePrefix ? {...out,stdout:out.stdout.replaceAll(base.toolNamePrefix,prefix)} : out;
   };
   if (nodeTooOld(process.version)) return fail("node", new CtxError("NODE_TOO_OLD", { v: process.version }));
   let ev: CanonicalHookEvent;
@@ -360,6 +364,9 @@ function b64(s: string): string {
 
 // §4.5 step 3 case B, D-M3-arch-3: run.mjs sits next to the running hook bundle (impl/13 §2).
 function caseB(ev: CanonicalHookEvent, row: AdapterRow, d0: Extract<Decision, { kind: "deny" }>, userDeny: string[] | null): Decision {
+  // The legacy wrapper opens its own stdio store. HTTP subagents keep the normal
+  // MCP redirect instead, so every index/journal write retains request identity.
+  if (httpScope.getStore()) return d0;
   const tool = ev.tool;
   if (tool === undefined || !isShell(tool, row) || isUserPolicyDeny(d0.reason, row)) return d0;
   const command = tool.input.command;

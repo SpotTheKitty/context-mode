@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
-export interface HttpScope { tenant: string; database: string; pending?: Set<Promise<unknown>>; closers?: Set<() => void>; }
+export interface HttpScope { tenant: string; database: string; toolPrefix?: string; pending?: Set<Promise<unknown>>; closers?: Set<() => void>; }
 export const httpScope = new AsyncLocalStorage<HttpScope>();
 
 export async function settleHttpScope(): Promise<void> {

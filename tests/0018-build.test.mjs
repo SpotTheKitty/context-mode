@@ -822,6 +822,9 @@ describe("ADR-0019 build: npm package", () => {
   const DEV = JSON.parse(readFileSync(path.join(REPO, "package.json"), "utf8")); // D-PKG-META-1: shared fields come from here
   const FIXTURE = JSON.parse(readFileSync(path.join(REPO, "e2e", "fixtures", "hook-roundtrip.json"), "utf8"));
   const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
+  const runNpm = (args, options) => process.platform === "win32"
+    ? spawnSync(process.execPath, [path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"), ...args], options)
+    : spawnSync(NPM, args, options);
   let out;
   let scratch;
 
@@ -862,7 +865,7 @@ describe("ADR-0019 build: npm package", () => {
 
   // D-NPM-README-1: the npm page shows README.md of the tarball. npm packs README.md and LICENSE from the package root.
   test("[NPM-README] build/npm-readme: npm pack --dry-run lists README.md and LICENSE, and no png", () => {
-    const p = spawnSync(NPM, ["pack", "--dry-run", "--json"], { cwd: out, encoding: "utf8", shell: process.platform === "win32" });
+    const p = runNpm(["pack", "--dry-run", "--json"], { cwd: out, encoding: "utf8" });
     assert.equal(p.status, 0, p.stderr);
     const listed = JSON.parse(p.stdout)[0].files.map((f) => f.path);
     assert.ok(listed.includes("README.md"), "README.md is in the tarball");
@@ -935,7 +938,9 @@ describe("ADR-0019 build: npm package", () => {
 
   test("[M7] build/npm-pack-equals-sums: npm pack file list and sha256 equal SHA256SUMS (plus SHA256SUMS itself)", () => {
     const dest = path.join(scratch, "pack");
-    const p = spawnSync(NPM, ["pack", "--json", "--pack-destination", (spawnSync("mkdir", ["-p", dest]), dest)], { cwd: out, encoding: "utf8", shell: process.platform === "win32" });
+    const { mkdirSync } = process.getBuiltinModule("node:fs");
+    mkdirSync(dest, { recursive: true });
+    const p = runNpm(["pack", "--json", "--pack-destination", dest], { cwd: out, encoding: "utf8" });
     assert.equal(p.status, 0, p.stderr);
     const [info] = JSON.parse(p.stdout);
     assert.equal(info.name, "context-mode");
@@ -944,7 +949,7 @@ describe("ADR-0019 build: npm package", () => {
     const expected = [...sums().map(([n]) => n), "SHA256SUMS"].sort();
     assert.deepEqual(listed, expected);
     const ex = path.join(scratch, "x");
-    spawnSync("mkdir", ["-p", ex]);
+    mkdirSync(ex, { recursive: true });
     const t = spawnSync("tar", ["-xzf", path.join(dest, info.filename), "-C", ex], { encoding: "utf8" });
     assert.equal(t.status, 0, t.stderr);
     for (const [rel, hex] of sums()) {
@@ -1050,7 +1055,7 @@ describe("ADR-0023 build: native host manifests", () => {
     assert.equal(b.status, 0, b.stderr);
     const dest = path.join(scratch, "pack");
     mkdirSync(dest);
-    const p = spawnSync(NPM, ["pack", "--json", "--pack-destination", dest], { cwd: out, encoding: "utf8", shell: process.platform === "win32" });
+    const p = runNpm(["pack", "--json", "--pack-destination", dest], { cwd: out, encoding: "utf8" });
     assert.equal(p.status, 0, p.stderr);
     const [info] = JSON.parse(p.stdout);
     const ex = path.join(scratch, "x");
