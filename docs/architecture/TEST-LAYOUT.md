@@ -36,7 +36,7 @@ Status: accepted 2026-10-30, move done. Decision record: [ADR-0024](adr/0024-tes
 | 0017-v1-retention | ADR-0017 | `tests/0017-v1-retention.test.mjs` | v1 vs v2 diff and the ported v1 executor and store tests | 37 | 20.4 |
 | 0018-contracts | ADR-0018 | `tests/0018-contracts.test.mjs` | module contracts and single-source hook file | 46 | 0.3 |
 | 0018-build | ADR-0018, ADR-0019, ADR-0023 | `tests/0018-build.test.mjs` | build, generated files, host manifests, npm package | 79 | 10.1 |
-| 0002-store | ADR-0002, PRD-v2 section 4, GP8, GP9 | `tests/0002-store.test.mjs` | single DB, schema, cleanup, checkpoint, owners, lifecycle exit | 63 | 8.5 |
+| 0002-store | ADR-0002, PRD-v2 section 4, GP8, GP9 | `tests/0002-store.test.mjs` | single DB, schema, cleanup, checkpoint, owners, lifecycle exit, HTTP fail-open and legacy import fallback | 79 | 8.5 |
 | 0007-identity | ADR-0007, PRD-v2 section 5, GP7 | `tests/0007-identity.test.mjs` | project and session identity, scope, containment, per-host home dirs | 86 | 6.4 |
 | 0007-mcp-server | ADR-0004, ADR-0005, ADR-0007, PRD-v2 sections 6-7 | `tests/0007-mcp-server.test.mjs` | MCP server, tool registry, call shapes, prompt delivery | 65 | 4.4 |
 | prd8-index-search | PRD-v2 section 8, GP5 | `tests/prd8-index-search.test.mjs` | chunking, index, FTS search, fetch, snippets | 201 | 8.3 |
@@ -76,4 +76,4 @@ Before: 242 unit files, 2624 test names, suite wall median 102 s (same machine, 
 
 tests/0014-repo-hygiene.test.mjs (section ADR-0024) fails for every *.test.mjs under tests and every case file under e2e/cases that this table does not list by path. The e2e files that stay in place are listed by path in the e2e-gp-keep row.
 
-ADR-0002 store coverage also checks HTTP tenant/project isolation, native hook forwarding, and the flat bundled server deployment layout.
+ADR-0002 store coverage also checks HTTP tenant/project isolation, native hook forwarding and fail-open transport errors, legacy import identity fallback and ownership overrides, and the flat bundled server deployment layout.
