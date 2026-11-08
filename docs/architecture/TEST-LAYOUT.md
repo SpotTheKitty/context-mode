@@ -75,3 +75,5 @@ Before: 242 unit files, 2624 test names, suite wall median 102 s (same machine, 
 ## Guard
 
 tests/0014-repo-hygiene.test.mjs (section ADR-0024) fails for every *.test.mjs under tests and every case file under e2e/cases that this table does not list by path. The e2e files that stay in place are listed by path in the e2e-gp-keep row.
+
+ADR-0002 store coverage also checks HTTP tenant/project isolation, native hook forwarding, and the flat bundled server deployment layout.
