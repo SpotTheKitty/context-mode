@@ -1246,9 +1246,58 @@ const {migrateTenantStore} = await import('../src/core/store/tenant-store.ts');
 const {ftsInsert,ftsQuery,deleteChunkRows} = await import('../src/core/store/fts.ts');
 const {listenHttp} = await import('../src/entries/server-http.ts');
 const {build} = await import('esbuild');
-const {spawn} = await import('node:child_process');
+const {spawn,spawnSync} = await import('node:child_process');
 const {writeFileSync} = await import('node:fs');
 const {fileURLToPath} = await import('node:url');
+const {importDatabase,runImport}=await import('../src/entries/import.ts');
+const {readFileSync,existsSync,mkdirSync}=await import('node:fs');
+const {createHash}=await import('node:crypto');
+
+test('import preflight derives private content workspaces and requires shared-root ownership data',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'cm-import-plan-'));const root=join(dir,'old');const shared=join(dir,'mixed');const workspace=join(dir,'workspace');for(const p of [root,shared,workspace])mkdirSync(p);
+ const table=join(dir,'table.json');const config={dataDir:join(dir,'new'),tenants:{alpha:{},beta:{}},imports:[{tenant:'alpha',root},{root:shared}]};
+ const session=new DatabaseSync(join(root,'session.db'));session.exec('CREATE TABLE session_meta(session_id TEXT,project_dir TEXT);CREATE TABLE session_events(id INTEGER PRIMARY KEY,session_id TEXT,data TEXT,project_dir TEXT);');session.prepare('INSERT INTO session_meta VALUES(?,?)').run('session',workspace);session.close();
+ const spelling=workspace.replaceAll('\\','/').toLowerCase();const hash=createHash('sha256').update(spelling).digest('hex').slice(0,16);
+ for(const file of [join(root,hash+'.db'),join(shared,'unknown.db')]){const db=new DatabaseSync(file);db.exec("CREATE TABLE sources(id INTEGER PRIMARY KEY,label TEXT,chunk_count INTEGER);CREATE VIRTUAL TABLE chunks USING fts5(content,source_id UNINDEXED,title);INSERT INTO sources VALUES(1,'old',1);INSERT INTO chunks VALUES('private content',1,'old');");db.close();}
+ try{
+  writeFileSync(table,JSON.stringify({contextMode:config}));assert.throws(()=>runImport(table,true),/explicit tenant\/workspace ownership/);assert.equal(existsSync(config.dataDir),false);
+  const {realpathSync}=process.getBuiltinModule('node:fs');config.importDatabaseMappings={[realpathSync.native(join(shared,'unknown.db')).replaceAll('\\','/')]:{tenant:'beta',workspace}};writeFileSync(table,JSON.stringify({contextMode:config}));
+  assert.equal(runImport(table).length,3);assert.equal(existsSync(config.dataDir),false);assert.equal(runImport(table,true).filter(x=>x.applied).length,3);
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('one-time legacy and current imports preserve sources and isolate HTTP search',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'cm-import-'));const store=join(dir,'shared');const project=join(dir,'workspace');mkdirSync(project);
+ const config={dataDir:store,tenants:{alpha:{agent:'codex'},beta:{agent:'codex'}},imports:[]};let host;
+ try{
+  const old=join(dir,'legacy.db');const db=new DatabaseSync(old);
+  db.exec('CREATE TABLE session_events(id INTEGER PRIMARY KEY,session_id TEXT,type TEXT,data TEXT,project_dir TEXT,created_at INTEGER);CREATE TABLE session_meta(session_id TEXT PRIMARY KEY,project_dir TEXT);CREATE TABLE session_resume(session_id TEXT,snapshot TEXT);');
+  db.prepare('INSERT INTO session_events VALUES(1,?,?,?,?,?)').run('same','tool','alpha importmarker',project,Date.now());db.prepare('INSERT INTO session_meta VALUES(?,?)').run('same',project);db.prepare('INSERT INTO session_resume VALUES(?,?)').run('same','original snapshot');db.close();
+  const before=readFileSync(old);const spec={tenant:'alpha',root:dir};
+  assert.equal(importDatabase(old,spec,config).rows,3);assert.equal(existsSync(store),false);
+  assert.equal(importDatabase(old,spec,config,true).applied,true);assert.equal(importDatabase(old,spec,config,true).alreadyImported,true);assert.deepEqual(readFileSync(old),before);
+  const modern=join(dir,'current.db');const p={projectKey:'old',projectDir:dir,dbPath:modern,worktree:project,containmentRoot:project,agent:'codex',source:'spawn-cwd'};
+  const current=await openDb(p);ftsInsert(current,{sessionId:'same',worktree:project,agent:'codex',kind:'content',label:'beta',bytes:20,createdAt:Date.now()},[{ord:0,text:'beta importmarker',bytes:20}]);metaSet(current,'original-meta','retained');closeDb(current);
+  const beforeCurrent=readFileSync(modern);importDatabase(modern,{tenant:'beta',root:dir},config,true);assert.deepEqual(readFileSync(modern),beforeCurrent);
+  const raw=new DatabaseSync(join(store,'context.db'));try{assert.equal(raw.prepare('SELECT COUNT(*) AS n FROM legacy_records WHERE tenant=? AND table_name=?').get('alpha','session_resume').n,1);assert.equal(raw.prepare('SELECT COUNT(*) AS n FROM sources').get().n,2);}finally{raw.close();}
+  host=await listenHttp({...config,host:'127.0.0.1',port:0,path:'/mcp',tenantHeader:'x-context-tenant',maxRequestBytes:1000000});
+  for(const tenant of ['alpha','beta']){
+   const res=await fetch(`http://127.0.0.1:${host.address().port}/mcp`,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json,text/event-stream','MCP-Protocol-Version':'2025-03-26','x-context-tenant':tenant},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'ctx_search',arguments:{queries:['importmarker'],_workspace:project,_sessionId:'same'}}})});
+   const result=JSON.stringify(await res.json());assert.equal(res.status,200);assert.match(result,new RegExp(tenant));assert.doesNotMatch(result,new RegExp(tenant==='alpha'?'beta':'alpha'));
+  }
+  const changed=new DatabaseSync(old);changed.prepare('UPDATE session_events SET data=?').run('changed');changed.close();assert.throws(()=>importDatabase(old,spec,config,true),/refuses synchronization/);
+ }finally{if(host)await new Promise(r=>host.close(r));rmSync(dir,{recursive:true,force:true});}
+});
+
+test('import rolls back orphan content and requires mappings for unavailable workspaces',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'cm-import-failure-'));const path=join(dir,'legacy.db');const db=new DatabaseSync(path);db.exec("CREATE TABLE sources(id INTEGER PRIMARY KEY,label TEXT);CREATE VIRTUAL TABLE chunks USING fts5(content,source_id UNINDEXED,title);INSERT INTO sources VALUES(1,'old');INSERT INTO chunks VALUES('orphan',2,'title');");db.close();
+ const config={dataDir:join(dir,'shared'),tenants:{alpha:{}},imports:[]};
+ try{
+  assert.throws(()=>importDatabase(path,{tenant:'alpha',root:dir,workspace:join(dir,'deleted')},config),/explicit mapping/);assert.equal(existsSync(config.dataDir),false);
+  assert.throws(()=>importDatabase(path,{tenant:'alpha',root:dir,workspace:dir},config,true),/Orphan chunk/);
+  const raw=new DatabaseSync(join(config.dataDir,'context.db'));try{for(const table of ['sources','chunks','legacy_records','meta'])assert.equal(raw.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n,0);}finally{raw.close();}
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
 
 test('tenant and project scope applies to FTS, vocabulary, metadata, mutations and legacy tagging',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'cm-tenants-'));const database=join(dir,'context.db');
@@ -1276,8 +1325,9 @@ test('tenant and project scope applies to FTS, vocabulary, metadata, mutations a
 test('bundled server runs from a flat directory without a repository or node_modules',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'cm-flat-'));let child;
  try{
-  await build({absWorkingDir:fileURLToPath(new URL('..',import.meta.url)),entryPoints:['src/entries/server-http.ts'],outfile:join(dir,'server-http.mjs'),bundle:true,platform:'node',format:'esm',target:'node24',external:['node:*'],banner:{js:'import {createRequire as __cmCreateRequire} from "node:module"; const require=__cmCreateRequire(import.meta.url);'}});
-  const table=join(dir,'endpoints.json');writeFileSync(table,JSON.stringify({contextMode:{host:'127.0.0.1',port:0,path:'/mcp',tenantHeader:'x-context-tenant',dataDir:join(dir,'data'),maxRequestBytes:1000000,tenants:{alpha:{agent:'codex'}}}}));
+  for(const name of ['server-http','import']) await build({absWorkingDir:fileURLToPath(new URL('..',import.meta.url)),entryPoints:[`src/entries/${name}.ts`],outfile:join(dir,`${name}.mjs`),bundle:true,platform:'node',format:'esm',target:'node24',external:['node:*'],banner:{js:'import {createRequire as __cmCreateRequire} from "node:module"; const require=__cmCreateRequire(import.meta.url);'}});
+  const table=join(dir,'endpoints.json');writeFileSync(table,JSON.stringify({contextMode:{host:'127.0.0.1',port:0,path:'/mcp',tenantHeader:'x-context-tenant',dataDir:join(dir,'data'),maxRequestBytes:1000000,tenants:{alpha:{agent:'codex'}},imports:[]}}));
+  const plan=spawnSync(process.execPath,[join(dir,'import.mjs'),table],{cwd:dir,encoding:'utf8',windowsHide:true});assert.equal(plan.status,0,plan.stderr);assert.deepEqual(JSON.parse(plan.stdout),[]);assert.equal(existsSync(join(dir,'data')),false);
   child=spawn(process.execPath,[join(dir,'server-http.mjs'),table],{cwd:dir,stdio:['ignore','ignore','pipe'],windowsHide:true});
   const ready=await new Promise((resolve,reject)=>{let text='';const timer=setTimeout(()=>reject(new Error('flat entry did not listen within 30 seconds: '+text)),30000);child.on('exit',code=>{clearTimeout(timer);reject(new Error('entry exited '+code+': '+text))});child.stderr.on('data',data=>{text+=data;for(const line of text.split('\n')){try{const row=JSON.parse(line);if(row.event==='listening'){clearTimeout(timer);resolve(row);return;}}catch{}}});});
   assert.equal(ready.pid,child.pid);assert.equal(ready.parentPid,process.pid);

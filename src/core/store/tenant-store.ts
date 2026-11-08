@@ -5,7 +5,7 @@ import type { DbHandle, ProjectContext } from "../contracts/types.ts";
 import { applyMigrations } from "./schema.ts";
 import { httpScope } from "./http-scope.ts";
 
-const TABLES = ["events", "sources", "meta", "chunks", "chunks_tri", "line_units"] as const;
+const TABLES = ["events", "sources", "meta", "chunks", "chunks_tri", "line_units", "legacy_records"] as const;
 const FTS = new Set(["chunks", "chunks_tri", "line_units"]);
 const quote = (s: string): string => "'" + s.replaceAll("'", "''") + "'";
 
@@ -14,6 +14,7 @@ const quote = (s: string): string => "'" + s.replaceAll("'", "''") + "'";
 export function migrateTenantStore(raw: DatabaseSync, tenant: string, project: string): void {
   const version = Number((raw.prepare("PRAGMA user_version").get() as {user_version:number}).user_version);
   applyMigrations(raw, version);
+  raw.exec("CREATE TABLE IF NOT EXISTS legacy_records (tenant TEXT NOT NULL, project_key TEXT NOT NULL, origin TEXT NOT NULL, table_name TEXT NOT NULL, record_key TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(tenant,project_key,origin,table_name,record_key))");
   if ((raw.prepare("PRAGMA table_info(sources)").all() as {name:string}[]).some(c => c.name === "tenant")) return;
   raw.exec("BEGIN IMMEDIATE");
   try {
