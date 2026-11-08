@@ -27,7 +27,10 @@ describe("PRD-v2 section 10: seeded hook fuzz on every host", () => {
   const SEEDS = [1, 7, 42, 1337, 2026, 9001, 31337, 65521];
   const N = Number(process.env.CM_FUZZ_N ?? 500);
   const SEED_LIST = process.env.CM_FUZZ_SEED_EXTRA ? [...SEEDS, Number(process.env.CM_FUZZ_SEED_EXTRA)] : SEEDS;
-  const WIDTH = Math.max(2, Math.min(6, cpus().length - 1));
+  // T225: Windows process startup competes with the six-child pool itself;
+  // cpu count is not available scheduling capacity. Keep every case and the real
+  // hook deadline, but run one child at a time, as the Windows area tests do.
+  const WIDTH = process.platform === "win32" ? 1 : Math.max(2, Math.min(6, cpus().length - 1));
   const IS_WIN = process.platform === "win32";
 
   let root;
