@@ -48,3 +48,6 @@ blanket approval or warning suppression is used.
 
 Sources: https://docs.npmjs.com/cli/v11/commands/npm-install-scripts/
 Context7 through litellm returned Monthly quota exceeded; retrieved via searchio.
+
+The Copilot fire fixture imports the source hook using pathToFileURL: Windows drive paths are filesystem paths, not ESM module URLs. This fixes ERR_UNSUPPORTED_ESM_URL_SCHEME in the full suite without changing the hook.
+The fake Copilot provider requests powershell/Get-Content on Windows and bash/cat elsewhere, matching the host's advertised shell. The disabled-hook control still requires the host's own large-output response.

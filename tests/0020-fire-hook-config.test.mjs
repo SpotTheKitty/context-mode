@@ -10,6 +10,7 @@ import http from "node:http";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, cpSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import path, { join, resolve } from "node:path";
 import { hostBin, runSetup } from "../src/setup/index.ts";
 import { spawnForm, whichBin } from "../src/setup/spawn-bin.ts";
@@ -255,7 +256,9 @@ describe("ADR-0020 fire, hook-config hosts", { concurrency: CONC }, () => {
           bodies.push(b);
           const j = JSON.parse(b || "{}");
           const hasTool = (j.messages || []).some((m) => m.role === "tool");
-          const call = { id: "call_1", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "cat big.log", description: "show" }) } };
+          // T225: Windows Copilot advertises powershell, not bash; exercise its real shell.
+          const windowsShell = process.platform === "win32";
+          const call = { id: "call_1", type: "function", function: { name: windowsShell ? "powershell" : "bash", arguments: JSON.stringify({ command: windowsShell ? "Get-Content big.log" : "cat big.log", description: "show" }) } };
           const delta = hasTool ? { role: "assistant", content: "done" } : { role: "assistant", tool_calls: [{ index: 0, ...call }] };
           const fin = hasTool ? "stop" : "tool_calls";
           const chunk = (d, f) => "data: " + JSON.stringify({ id: "c" + n, object: "chat.completion.chunk", model: "fake", choices: [{ index: 0, delta: d, finish_reason: f }], ...(f ? { usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } } : {}) }) + "\n\n";
@@ -281,7 +284,7 @@ describe("ADR-0020 fire, hook-config hosts", { concurrency: CONC }, () => {
     process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result }) + "\\n");
   });
   `);
-      writeFileSync(join(dir, "hook.mjs"), `import ${JSON.stringify(HOOK)};\n`); // the real hook entry, run through the setup-written command
+      writeFileSync(join(dir, "hook.mjs"), `import ${JSON.stringify(pathToFileURL(HOOK).href)};\n`); // the real hook entry, run through the setup-written command
       writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "context-mode", version: "2.0.0" }));
       generateManifests(dir);
       for (const s of SKILLS) cpSync(join(REPO, "skills", s), join(dir, "skills", s), { recursive: true });
