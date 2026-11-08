@@ -1117,12 +1117,12 @@ describe("ADR-0013: dev tree version", { concurrency: CONC }, () => {
     assert.ok(readFileSync(path.join(REPO, "bench", "fixtures", "run.mjs"), "utf8").includes("devVersionLabel("), "bench/fixtures/run.mjs too");
   });
 
-  test("this repo: package.json and every source-tree manifest are not behind the highest pushed v2 tag", (t) => {
-    const r = spawnSync(process.execPath, [SCRIPT, "--check"], { cwd: REPO, encoding: "utf8" });
-    if (r.status === 2) return t.skip("no tags readable from origin here: " + r.stderr.trim());
-    assert.equal(r.status, 0, r.stderr);
+  test("this fork: package.json and every source-tree manifest have the same version", () => {
+    // T225: origin is upstream, whose newer releases need not be ancestors of this fork.
+    // A fork must not claim an unmerged upstream version. The fixture tests above retain
+    // --check coverage; this checkout assertion checks manifest consistency without a moving network dependency.
     const v = get(REPO, "package.json").version;
-    for (const f of SOURCES) assert.ok(readFileSync(path.join(REPO, f), "utf8").includes('"version": "' + v + '"'), f + " is not at " + v);
+    for (const f of SOURCES.filter((f) => f !== "package-lock.json" || existsSync(path.join(REPO, f)))) assert.ok(readFileSync(path.join(REPO, f), "utf8").includes('"version": "' + v + '"'), f + " is not at " + v);
   });
 
   test("release.yml: a pushed v2.* tag ends with a job that writes the tag version back to v2-design (tag, not main, not release)", () => {

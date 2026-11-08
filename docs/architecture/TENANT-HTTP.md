@@ -26,3 +26,25 @@ Explicit importProjectMappings and importDatabaseMappings remain ownership overr
 All sources are preflighted before destination creation. Each applied source is transactional; orphaned content rolls back its imported rows. A digest marker makes an unchanged rerun a no-op and rejects a changed source rather than synchronizing it. Quiesce the old writers and retain source backups during coordinator rollout. The importer never renames, checkpoints or writes a source database. Plans and tests do not run against the live workstation store.
 
 Hook contract sources: src/core/contracts/types.ts (AdapterRow), src/adapters/claude-code.ts (encodeClaudeShape), src/core/hooks/fallback.ts (logHookError); https://code.claude.com/docs/en/hooks (empty output and exit zero continue); https://nodejs.org/api/sqlite.html (DatabaseSync readOnly and transactions).
+# Fork suite maintenance (T225)
+
+The Windows grandchild check polls for cleanup after cancellation within a bounded
+PID_WAIT_MS window. A notification write is not an acknowledgement: parallel load
+adds scheduling delay, and Windows taskkill has no POSIX KILL_GRACE_MS deadline.
+The check still requires ten runs and zero surviving grandchildren. Runtime kill
+behavior is unchanged; this corrects an unsupported one-second harness deadline.
+
+The checkout manifest test checks consistency of the fork source manifests.
+origin points to mksglu/context-mode; its v2.1.7 tag is not an ancestor of this
+fork, whose version is 2.1.6. Requiring the fork to match that tag would claim
+unmerged upstream code. The isolated release-script fixtures still test --check
+against pushed tags. package-lock.json is optional, as in setVersions; it is not
+tracked in this fork and installation uses --no-package-lock.
+
+npm 11.20 blocks undeclared install scripts. package.json approves only the
+reviewed esbuild@0.24.0 postinstall (node install.js), using npm install-scripts
+approve esbuild. Its installer selects and validates the platform binary. No
+blanket approval or warning suppression is used.
+
+Sources: https://docs.npmjs.com/cli/v11/commands/npm-install-scripts/
+Context7 through litellm returned Monthly quota exceeded; retrieved via searchio.

@@ -5,7 +5,7 @@
 // Black box: spawns release-out/server.mjs only; imports nothing from src/ (GS4).
 // Windows: 10 runs. Each run: ctx_execute runs a JavaScript child that spawns a grandchild direct
 // (no cmd.exe between) and writes the grandchild PID to a file; the check sends
-// notifications/cancelled, waits KILL_GRACE_MS, then asks `tasklist /FI "PID eq <pid>"`.
+// notifications/cancelled, waits for bounded cleanup, then asks `tasklist /FI "PID eq <pid>"`.
 // Other platforms: prints a SKIPPED JSON line and exits 0.
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
@@ -61,7 +61,8 @@ for (let i = 0; i < RUNS; i++) {
     "setInterval(() => {}, 1000);";
   const client = spawnBundle(SERVER_BUNDLE, ENV);
   await client.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "e2e", version: "0.0.0" } });
-  client.request("tools/call", { name: "ctx_execute", arguments: { language: "javascript", code } }).catch(() => {});
+  const execution = client.request("tools/call", { name: "ctx_execute", arguments: { language: "javascript", code } });
+  execution.catch(() => {});
   const start = Date.now();
   while (!existsSync(pidFile) || readFileSync(pidFile, "utf8") === "") {
     if (Date.now() - start > PID_WAIT_MS) break;
@@ -69,9 +70,16 @@ for (let i = 0; i < RUNS; i++) {
   }
   const gpid = existsSync(pidFile) ? Number(readFileSync(pidFile, "utf8")) : NaN;
   client.notify("notifications/cancelled", { requestId: 2 }); // id 1 = initialize, id 2 = this tools/call
+  // T225: cancellation is an asynchronous notification; Windows taskkill has no
+  // KILL_GRACE_MS SLA. Bound the end-to-end cleanup wait separately from POSIX grace.
   await sleep(graceMs);
-  const left = Number.isInteger(gpid) && gpid > 0 ? alive(gpid) : null;
-  // Diagnosis only (the pass rule above is unchanged): a grandchild still alive at KILL_GRACE_MS is polled for
+  let left = Number.isInteger(gpid) && gpid > 0 ? alive(gpid) : null;
+  const cleanupStart = Date.now();
+  while (left && Date.now() - cleanupStart < PID_WAIT_MS) {
+    await sleep(100);
+    left = alive(gpid);
+  }
+  // Diagnosis only: a grandchild still alive after the bounded cleanup wait is polled for
   // up to LATE_POLL_MS. `diedAfterMs` set = the tree kill was only slow; null = it never reached the grandchild.
   let diedAfterMs = null;
   if (left) {
@@ -81,7 +89,7 @@ for (let i = 0; i < RUNS; i++) {
       if (!alive(gpid)) { diedAfterMs = graceMs + (Date.now() - t0); break; }
     }
   }
-  results.push(left ? { run: i + 1, gpid, alive: left, diedAfterMs } : { run: i + 1, gpid, alive: left });
+  results.push({ run: i + 1, gpid, alive: left, ...(left ? { diedAfterMs } : {}) });
   if (left && diedAfterMs === null) spawnSync("taskkill", ["/F", "/PID", String(gpid)], { shell: false });
   await client.close();
 }
