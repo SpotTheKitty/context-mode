@@ -129,6 +129,7 @@ const ALLOWED_FILES = [
   ...ALLOWED_SKILL_FILES,
   ".claude/settings.json",
   // Scripts.
+  "scripts/test-suite.mjs", "scripts/test-suite.json", "scripts/test-lock.mjs",
   "scripts/gate.mjs", "scripts/ci-gs4-lint.mjs", "scripts/record-fixtures.mjs", "scripts/ci-install.mjs",
   // v2 user docs outside docs/architecture and docs/install (cleanup-plan §2).
   "docs/how-it-works.md", "docs/tools.md", "docs/algorithms.md", "docs/performance.md", "docs/UPSTREAM-CREDITS.md",

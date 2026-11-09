@@ -3,6 +3,8 @@
 // Merged by ADR-0024 from 7 files (see docs/architecture/TEST-LAYOUT.md). One describe block per old file; test names are unchanged.
 // pi-gate is serial because its tests call process.chdir; the other blocks use own temp dirs and explicit env, so they run concurrently.
 import { describe, test } from "node:test";
+import { spawnSync as fixtureSpawnSync } from "node:child_process";
+import { listCopilotHooks } from "../src/setup/copilot-hooks.ts";
 import { CONC } from "./_lib/concurrency.mjs";
 import assert from "node:assert/strict";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -178,12 +180,13 @@ describe("ADR-0020 gates (concurrent blocks)", { concurrency: CONC === true ? 2 
     const key = (source, event) => createHash("sha256").update(source + "\n" + event).digest("hex");
 
     const STUB = `
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 const args = process.argv.slice(2);
-if (!args.includes("--server")) { console.log("context-mode"); process.exit(0); }
+if (!args.includes("--server")) { console.log(process.env.STUB_MISSING_MCP ? "No servers configured" : "context-mode"); process.exit(0); }
 if (process.env.STUB_NO_ANSWER) process.exit(0);
+if (process.env.STUB_HOLD_OPEN) { writeFileSync(process.env.STUB_PID_FILE, String(process.pid)); setInterval(() => {}, 1000); }
 const dir = process.env.COPILOT_HOME || path.join(process.env.HOME, ".copilot");
 const read = (f) => { try { return JSON.parse(readFileSync(f, "utf8")); } catch { return {}; } };
 let buf = Buffer.alloc(0);
@@ -201,6 +204,12 @@ process.stdin.on("data", (d) => {
     return { id: "hook:" + k, hookType: event, origin: "user", source: path.relative(dir, file).split(path.sep).join("/"), enabled: !set.disableAllHooks && !(set.disabledHooks || []).includes(k), ...(set.disableAllHooks ? {} : { disableKey: k }) };
   });
   const body = JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { hooks, warnings: [], errors: [] } });
+  if (process.env.STUB_PROTOCOL_NOISE) {
+    for (const message of [{ jsonrpc: "2.0", method: "log", params: {} }, { jsonrpc: "2.0", id: 99, result: { hooks: [] } }]) {
+      const noise = JSON.stringify(message);
+  process.stdout.write("Content-Length: " + Buffer.byteLength(noise) + "\\r\\n\\r\\n" + noise);
+    }
+  }
   process.stdout.write("Content-Length: " + Buffer.byteLength(body) + "\\r\\n\\r\\n" + body);
 });
 `;
@@ -309,6 +318,38 @@ createInterface({ input: process.stdin }).on("line", (l) => {
       assert.equal(c.ok, true);
       assert.equal(c.warn, true);
       assert.match(c.detail, /copilot did not report hook state/);
+    });
+    test("T225 discovery releases the Windows shim descendant and its stdout pipe", { skip: process.platform !== "win32" && "Windows command-shim descendant regression" }, async (t) => {
+      const s = sandbox(t);
+      mkdirSync(path.dirname(s.hookFile), { recursive: true });
+      writeFileSync(s.hookFile, JSON.stringify({ version: 1, hooks: { preToolUse: [{ type: "command", command: "fixture" }] } }));
+      const pidFile = path.join(s.root, "discovery.pid");
+      let pid;
+      const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      try {
+        const hooks = await listCopilotHooks({ ...s.env, STUB_HOLD_OPEN: "1", STUB_PID_FILE: pidFile }, s.hookFile, s.home);
+        assert.ok(hooks?.some((h) => h.event === "preToolUse"), "the framed fixture reply was parsed");
+        pid = Number(readFileSync(pidFile, "utf8"));
+        for (let i = 0; i < 20 && alive(); i++) await new Promise((r) => setTimeout(r, 50));
+        assert.equal(alive(), false, "discovery left a shim descendant alive holding its stdout pipe; the test file cannot exit");
+      } finally {
+        if (pid === undefined && existsSync(pidFile)) pid = Number(readFileSync(pidFile, "utf8"));
+        if (Number.isInteger(pid) && alive()) fixtureSpawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore" });
+      }
+    });
+    test("T225 Copilot missing MCP registration fixture fails setup with the list cause", async (t) => {
+      const s = sandbox(t, { STUB_MISSING_MCP: "1" });
+      const result = await runSetup(opts(s, { runId: "missing-mcp" }));
+      assert.equal(result.exitCode, 1);
+      assert.match(result.agents[0].reason, /mcp list does not list context-mode/);
+    });
+    test("T225 discovery ignores notifications and unrelated JSON-RPC responses", async (t) => {
+      const s = sandbox(t);
+      mkdirSync(path.dirname(s.hookFile), { recursive: true });
+      writeFileSync(s.hookFile, JSON.stringify({ version: 1, hooks: { preToolUse: [{ type: "command", command: "fixture" }] } }));
+      const hooks = await listCopilotHooks({ ...s.env, STUB_PROTOCOL_NOISE: "1" }, s.hookFile, s.home);
+      assert.equal(hooks?.length, 1, "only the response matching hooks.discover is the answer");
+      assert.equal(hooks[0].event, "preToolUse");
     });
   });
 

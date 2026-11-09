@@ -17,10 +17,11 @@ import { spawnForm, whichBin } from "../src/setup/spawn-bin.ts";
 import { TOOL_ORDER } from "../src/core/contracts/constants.ts";
 import { generateManifests } from "../build/manifests.ts";
 import { listCopilotHooks } from "../src/setup/copilot-hooks.ts";
+import { kiroLoadedEvent } from "./_lib/host-probe-fixtures.mjs";
 
 // Agent describes run concurrently (each owns its temp dirs and fake provider). Tests inside one describe stay serial:
 // they share the built package, and a concurrent run hit ENOTEMPTY on the shared temp dir (codex).
-describe("ADR-0020 fire, hook-config hosts", { concurrency: CONC }, () => {
+describe("ADR-0020 fire, hook-config hosts", { concurrency: CONC, skip: process.env.CM_REAL_HOST_E2E !== "1" && "e2e: requires installed agent clients and temporary homes; set CM_REAL_HOST_E2E=1. Unit host-probe fixtures run in 0020-gates tests." }, () => {
   describe("ADR-0020 fire claude-code", () => {
     // D-CC-HOOKS-RUN-1: the real `claude -p` (no login, fake Anthropic Messages endpoint through ANTHROPIC_BASE_URL) runs
     // Bash "cat big.log" on a 200 KB file. The plugin is installed the documented way (`claude plugin marketplace add`
@@ -85,7 +86,7 @@ describe("ADR-0020 fire, hook-config hosts", { concurrency: CONC }, () => {
       const seen = [];
       const srv = provider(seen);
       await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-      t.after(() => srv.close());
+      t.after(() => { srv.closeAllConnections(); return new Promise((resolve) => srv.close(resolve)); });
       const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: join(home, ".claude"),
         ANTHROPIC_BASE_URL: `http://127.0.0.1:${srv.address().port}`, ANTHROPIC_API_KEY: "sk-fake", DISABLE_TELEMETRY: "1",
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1", CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1" };
@@ -301,14 +302,20 @@ describe("ADR-0020 fire, hook-config hosts", { concurrency: CONC }, () => {
       const bodies = [];
       const srv = provider(bodies);
       await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-      t.after(() => srv.close());
+      t.after(() => { srv.closeAllConnections(); return new Promise((resolve) => srv.close(resolve)); });
       const port = srv.address().port;
       const copilotHome = join(home, ".copilot");
       const env = { ...process.env, HOME: home, USERPROFILE: home, COPILOT_HOME: copilotHome, CM_HOOK_OVERHEAD_BUDGET_MS: "60000" };
       mkdirSync(copilotHome, { recursive: true });
       const hookFile = join(copilotHome, "hooks", "context-mode.json");
       // The disable key is a host-side hash: take it from the host's own hooks.discover, never compute it.
-      const keyOf = async () => (await listCopilotHooks(env, hookFile, work)).find((h) => h.event === "preToolUse").disableKey;
+      const keyOf = async () => {
+        const hooks = await listCopilotHooks(env, hookFile, work);
+        assert.ok(hooks, "e2e prerequisite: installed Copilot did not return a parsed hooks.discover result");
+        const hook = hooks.find((h) => h.event === "preToolUse");
+        assert.ok(hook?.disableKey, "e2e prerequisite: Copilot did not register a disable key for the installed hook");
+        return hook.disableKey;
+      };
       if (disable !== "before") {
         const r = await runSetup({ home, pkgDir: pkg(root), env, agents: ["copilot-cli"], runId: "r1" });
         assert.equal(r.exitCode, 0, JSON.stringify(r.agents.map((a) => [a.id, a.status, a.reason])));
@@ -402,7 +409,7 @@ describe("ADR-0020 fire, hook-config hosts", { concurrency: CONC }, () => {
       const bodies = [];
       const srv = provider(command, bodies);
       await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-      t.after(() => srv.close());
+      t.after(() => { srv.closeAllConnections(); return new Promise((resolve) => srv.close(resolve)); });
       const env = { ...process.env, HOME: home, USERPROFILE: home, GEMINI_CLI_HOME: home, GOOGLE_GEMINI_BASE_URL: `http://127.0.0.1:${srv.address().port}`,
         GEMINI_API_KEY: "fake", GEMINI_CLI_TRUST_WORKSPACE: "true", GEMINI_CLI_SYSTEM_SETTINGS_PATH: join(d, "no-system.json") };
       const link = spawnSync("gemini", ["extensions", "link", pkg], { cwd: work, env, input: "y\n", encoding: "utf8", timeout: 60000 });
@@ -469,7 +476,6 @@ describe("ADR-0020 fire, hook-config hosts", { concurrency: CONC }, () => {
       return r.status === 0 ? r.stdout.split("\n")[0].trim() : undefined;
     }
     const BIN = findBin();
-    const LOADED = "hooks.reload.loaded ";
     const WAIT_MS = 60000;
 
     function fakePkg(root) {
@@ -501,8 +507,8 @@ describe("ADR-0020 fire, hook-config hosts", { concurrency: CONC }, () => {
       for (const run of readdirSync(logs)) {
         const log = path.join(logs, run, "kiro.log");
         if (!existsSync(log)) continue;
-        const line = readFileSync(log, "utf8").split("\n").find((l) => l.includes(LOADED));
-        if (line) return JSON.parse(JSON.parse(line).message.slice(LOADED.length));
+        const event = kiroLoadedEvent(readFileSync(log, "utf8"));
+        if (event) return event;
       }
       return undefined;
     }

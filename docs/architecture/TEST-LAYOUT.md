@@ -77,3 +77,38 @@ Before: 242 unit files, 2624 test names, suite wall median 102 s (same machine, 
 tests/0014-repo-hygiene.test.mjs (section ADR-0024) fails for every *.test.mjs under tests and every case file under e2e/cases that this table does not list by path. The e2e files that stay in place are listed by path in the e2e-gp-keep row.
 
 ADR-0002 store coverage also checks HTTP tenant/project isolation, native hook forwarding and fail-open transport errors, legacy import identity fallback and ownership overrides, and the flat bundled server deployment layout.
+
+## Bounded unit suite and real-host e2e (T225)
+
+`npm test` runs `scripts/test-suite.mjs`. It builds generated source, takes the
+T202-compatible workstation lock (`crew-runtime-tests.lock` in the temp directory),
+and runs every unit test file with the spec reporter, one file at a time. The
+lock uses `{pid, startedAt, cwd}`, exclusive creation, live-owner waiting, stale
+owner reclamation and owner-checked release. Limits and lock rules are data in
+`scripts/test-suite.json`; `--timeout-ms` overrides only the per-file watchdog.
+The M2 benchmark's own 60-second assertion and production hook deadlines remain
+unchanged. A watchdog reports the file and last completed test, terminates the
+owned process tree, and continues. Missing summaries and nonzero exits fail the
+run. The final `FULL SUITE` line aggregates the same run's native file summaries;
+`fileFailures` and `timeouts` separately identify incomplete files. Interrupted
+runs print `FULL SUITE PARTIAL`. `TEST_LOCK_DIR` and `TEST_LOCK_WAIT_SECONDS` use
+T202's meanings.
+
+`0020-fire-hook-config.test.mjs` and `0020-fire-plugin-ext.test.mjs` probe real
+installed clients, even though their providers and homes are temporary. They are
+opt-in e2e suites, named as skipped with the reason in the unit output. Set
+`CM_REAL_HOST_E2E=1` and use `node scripts/test-suite.mjs --file
+0020-fire-hook-config.test.mjs` (or the plugin/ext file) to run them. When enabled,
+the existing per-client checks still name a missing binary and its skip reason.
+The aggregate separately reports `e2eSuitesSkipped`, since Node's native leaf-test
+skip counter does not count a skipped describe that registers no children.
+
+The unit gates retain the synthetic Copilot command/framed-JSON fixture, including
+missing MCP registration, disabled hooks and re-enablement. A persistent stub
+server verifies discovery closes stdout and kills a Windows shim's descendant.
+The Kiro loader-event fixture shares its parser with the real e2e check; it checks
+registered/read counts and rejects missing or malformed acknowledgements. Kiro
+configuration/enabled-entry tests remain deterministic unit fixtures. These tests
+exercise the contracts without installing a client or using a machine home.
+
+The watchdog's process cleanup is separately bounded by cleanupTimeoutSeconds in the policy file. The runner prints its own PID before lock acquisition, and handled interrupts cancel lock waiting without releasing another process's lock. Discovery fixtures include notifications and unrelated response IDs before the requested response.

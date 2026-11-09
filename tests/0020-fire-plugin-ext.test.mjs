@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 import { runDoctor, runSetup } from "../src/setup/index.ts";
 
 // Agent describes run concurrently (each owns its temp dirs and fake provider). Tests inside one describe stay serial: they share the built package.
-describe("ADR-0020 fire, plugin and extension hosts", { concurrency: CONC }, () => {
+describe("ADR-0020 fire, plugin and extension hosts", { concurrency: CONC, skip: process.env.CM_REAL_HOST_E2E !== "1" && "e2e: requires installed agent clients and temporary homes; set CM_REAL_HOST_E2E=1. Unit host-probe fixtures run in 0020-gates tests." }, () => {
   describe("ADR-0020 fire opencode", () => {
     // D-HF-OPENCODE-FIRE-1: the real `opencode run` (no login, no key) against a local fake OpenAI-compatible provider calls
     // the bash tool with `cat big.log` (200 KB). Our built plugin (opencode/plugin.js, loaded from the config `plugin` list)
@@ -202,7 +202,7 @@ describe("ADR-0020 fire, plugin and extension hosts", { concurrency: CONC }, () 
       const bodies = [];
       const srv = provider(command, bodies);
       await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-      t.after(() => srv.close());
+      t.after(() => { srv.closeAllConnections(); return new Promise((resolve) => srv.close(resolve)); });
       writeFileSync(join(agent, "models.json"), JSON.stringify({ providers: { fake: { baseUrl: `http://127.0.0.1:${srv.address().port}/v1`, api: "openai-completions", apiKey: "x", models: [{ id: "fake-model" }] } } }));
       const env = { ...process.env, HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1" };
       const inst = spawnSync("pi", ["install", pkg], { cwd: work, env, encoding: "utf8", timeout: 60000 });
@@ -411,7 +411,7 @@ describe("ADR-0020 fire, plugin and extension hosts", { concurrency: CONC }, () 
       const bodies = [];
       const srv = provider(command, bodies);
       await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-      t.after(() => srv.close());
+      t.after(() => { srv.closeAllConnections(); return new Promise((resolve) => srv.close(resolve)); });
       const env = { PATH: process.env.PATH, HOME: home, USERPROFILE: home, ZCODE_DATA_BASE_DIR: home };
       mkdirSync(join(home, ".zcode", "v2"), { recursive: true });
       writeFileSync(join(home, ".zcode", "v2", "provider_config.json"), JSON.stringify({ schemaVersion: 1, config: {

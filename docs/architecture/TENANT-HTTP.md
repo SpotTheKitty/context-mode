@@ -52,3 +52,23 @@ Context7 through litellm returned Monthly quota exceeded; retrieved via searchio
 The Copilot fire fixture imports the source hook using pathToFileURL: Windows drive paths are filesystem paths, not ESM module URLs. This fixes ERR_UNSUPPORTED_ESM_URL_SCHEME in the full suite without changing the hook.
 The fake Copilot provider requests powershell/Get-Content on Windows and bash/cat elsewhere, matching the host's advertised shell. The disabled-hook control still requires the host's own large-output response.
 Windows hook fuzz runs one child at a time. The former six-child pool produced five-second deadline failures in Kiro with four test files and in VS Code even with serial test files. CPU count did not represent available scheduling capacity. All 500 cases per host, fixed seeds, named regressions and the production HOOK_TIMEOUT_MS remain unchanged; only test load is serialized.
+
+## Probe cleanup and suite boundary (T225 follow-up)
+
+Copilot discovery previously killed only the command shim. A server descendant
+could retain its stdout pipe and keep `0020-fire-hook-config.test.mjs` alive after
+its tests reported failures. The fixture regression in
+`0020-gates-pi-copilot-claude.test.mjs` reproduces that lifetime with a persistent
+server. Discovery now destroys its pipe reader and terminates the owned process
+tree; non-Windows children lead a process group so the existing killTree contract
+applies. The regression checks the server PID is gone and the file exits naturally.
+No force-exit option is used for acceptance.
+
+Real installed-client fire checks are e2e, explicitly opt-in with named skip
+reasons. Unit fixtures cover Copilot discovery and MCP registration failures and
+the Kiro loader event/configuration contract. The bounded, locked full-suite
+entrypoint and its skip/count semantics are documented in TEST-LAYOUT.md. This
+follow-up keeps the workstation runtime pin at 645d7ca1 as requested; no runtime
+was deployed from the checkout cleanup changes.
+
+A second framed-transport fixture sends a notification and an unrelated response before the matching hooks.discover reply. The former first-frame parser returned undefined. Discovery now consumes complete frames until the matching request id; its API and deadline remain unchanged. Reference: https://www.jsonrpc.org/specification .

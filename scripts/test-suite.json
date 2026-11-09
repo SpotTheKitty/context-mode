@@ -1,0 +1,23 @@
+{
+  "fileTimeoutSeconds": 900,
+  "nodeArgs": [
+    "--test",
+    "--test-concurrency=1",
+    "--test-reporter=spec"
+  ],
+  "testSuffix": ".test.mjs",
+  "lock": {
+    "fileName": "crew-runtime-tests.lock",
+    "pollMs": 2000,
+    "announceMs": 30000,
+    "maxWaitMs": 3600000,
+    "maxHoldMs": 7200000,
+    "partialFileMs": 10000
+  },
+  "ignoredDirectories": [
+    ".git",
+    ".prompts",
+    "node_modules"
+  ],
+  "cleanupTimeoutSeconds": 15
+}

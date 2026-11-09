@@ -495,3 +495,57 @@ process.stdin.on("end", () => {
     test("live-local repo-cleanup-gate", () => runLocal("repo-cleanup-gate"));
   });
 });
+
+describe("T225 bounded full-suite runner", () => {
+  const runnerSource = fileURLToPath(new URL("../scripts/", import.meta.url));
+  function fixture(t) {
+    const root = fs.realpathSync(mkdtempSync(path.join(tmpdir(), "cm-suite-driver-")));
+    for (const name of ["scripts", "tests", "locks"]) fs.mkdirSync(path.join(root, name));
+    for (const name of ["test-suite.mjs", "test-lock.mjs", "test-suite.json"]) fs.copyFileSync(path.join(runnerSource, name), path.join(root, "scripts", name));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    return { root, tests: path.join(root, "tests"), lock: path.join(root, "locks"), script: path.join(root, "scripts", "test-suite.mjs") };
+  }
+  function run(s, extra = []) {
+    const env = { ...process.env, TEST_LOCK_DIR: s.lock };
+    delete env.TEST_LOCK_WAIT_SECONDS;
+    return spawnSync(process.execPath, [s.script, "--no-build", "--timeout-ms", "10000", ...extra], { cwd: s.root, env, encoding: "utf8", timeout: 30000 });
+  }
+  test("T225 runner discovers nested files and summarizes from a copied layout with no repository", (t) => {
+    const s = fixture(t);
+    fs.mkdirSync(path.join(s.tests, "nested"));
+    for (const name of ["a.test.mjs", "nested/b.test.mjs"]) writeFileSync(path.join(s.tests, name), 'import {test} from "node:test"; test("fixture passes",()=>{});');
+    const r = run(s);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /FULL SUITE: files=2 tests=2 suites=0 pass=2 fail=0/);
+    assert.equal(fs.existsSync(path.join(s.lock, "crew-runtime-tests.lock")), false, "released the workstation lock");
+  });
+  test("T225 per-file watchdog names the hanging test, frees its port and continues", async (t) => {
+    const s = fixture(t);
+    const portFile = path.join(s.root, "port");
+    writeFileSync(path.join(s.tests, "a-hang.test.mjs"), `import {test} from 'node:test'; import net from 'node:net'; import {writeFileSync} from 'node:fs'; test('owned open-port fixture',()=>{const server=net.createServer(); server.listen(0,'127.0.0.1',()=>writeFileSync(${JSON.stringify(portFile)},String(server.address().port)));});`);
+    writeFileSync(path.join(s.tests, "b-pass.test.mjs"), 'import {test} from "node:test"; test("following file passed",()=>{});');
+    const r = run(s, ["--timeout-ms", "5000"]);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /a-hang.test.mjs exit=124 TIMEOUT last=.*owned open-port fixture/);
+    assert.match(r.stdout, /following file passed/);
+    assert.match(r.stdout, /fileFailures=1 timeouts=1/);
+    const net = await import("node:net");
+    const server = net.createServer();
+    await new Promise((resolve, reject) => { server.once("error", reject); server.listen(Number(readFileSync(portFile, "utf8")), "127.0.0.1", resolve); });
+    await new Promise((resolve) => server.close(resolve));
+  });
+  test("T225 runner waits for a T202 lock holder and leaves its lock intact", (t) => {
+    const s = fixture(t);
+    writeFileSync(path.join(s.tests, "a.test.mjs"), 'import {test} from "node:test"; test("must not start",()=>{});');
+    const lockFile = path.join(s.lock, "crew-runtime-tests.lock");
+    writeFileSync(lockFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), cwd: s.root }));
+    const configPath = path.join(s.root, "scripts", "test-suite.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    config.lock.maxWaitMs = 100; config.lock.pollMs = 10;
+    writeFileSync(configPath, JSON.stringify(config));
+    const r = run(s);
+    assert.equal(r.status, 75, r.stdout + r.stderr);
+    assert.match(r.stdout + r.stderr, new RegExp(`held by pid ${process.pid}`));
+    assert.equal(JSON.parse(readFileSync(lockFile, "utf8")).pid, process.pid);
+  });
+});

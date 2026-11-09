@@ -31,6 +31,7 @@
     "url": "https://github.com/mksglu/context-mode/issues"
   },
   "scripts": {
+    "test": "node scripts/test-suite.mjs",
     "build": "node build/build.mjs --out release-out",
     "build:release": "node build/build.mjs --out release-out",
     "typecheck": "tsc --noEmit",
