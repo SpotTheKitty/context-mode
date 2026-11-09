@@ -1,4 +1,5 @@
 // T202 lock protocol, ported from AgentEcosystem/runtime/ts/src/testLock.ts.
+// Local lease handling keeps the same shared record and stale-owner policy.
 import { closeSync, copyFileSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { join } from "node:path";
 class LockWaitTimeout extends Error {
@@ -45,6 +46,11 @@ function readRaw(path) {
     return void 0;
   }
 }
+function acquiredSince(holder, modified) {
+  // Older writers stamp queue entry. The lock file is written on acquisition.
+  const claimed = Date.parse(holder.startedAt);
+  return Number.isFinite(claimed) ? Math.max(claimed, modified) : modified;
+}
 async function acquireLock(options) {
   const { rules } = options;
   const path = join(options.dir, rules.fileName);
@@ -69,7 +75,7 @@ async function acquireLock(options) {
       }
       const waitedMs = now() - began;
       if (waitedMs > 0 && announcedFor !== "") log(`test lock ${path} taken after waiting ${duration(waitedMs)}`);
-      return { path, waitedMs, release: () => releaseLock(path, pid) };
+      return { path, waitedMs, acquiredAtMs: Date.parse(mine.startedAt), release: () => releaseLock(path, pid) };
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
     }
@@ -88,7 +94,7 @@ async function acquireLock(options) {
       if (now() - modified > rules.partialFileMs) staleReason = "the lock file is not a lock";
     } else if (!isAlive(holder.pid)) {
       staleReason = `holder ${describeHolder(holder, now())} is gone`;
-    } else if (Date.parse(holder.startedAt) < now() - rules.maxHoldMs) {
+    } else if (acquiredSince(holder, modified) < now() - rules.maxHoldMs) {
       staleReason = `holder ${describeHolder(holder, now())} has held it longer than ${duration(rules.maxHoldMs)}`;
     }
     if (staleReason !== "") {
@@ -147,6 +153,12 @@ function releaseLock(path, pid) {
   } catch {
   }
 }
+export function leaseNeedsRotation({ heldMs, completedFiles, fileBudgetMs, cleanupBudgetMs, rules }) {
+  const fileLimit = rules.maxFilesPerLease ?? 0;
+  return (fileLimit > 0 && completedFiles >= fileLimit) ||
+    heldMs + fileBudgetMs + cleanupBudgetMs + (rules.leaseReserveMs ?? 0) >= rules.maxHoldMs;
+}
+
 export {
   LockWaitTimeout,
   acquireLock,

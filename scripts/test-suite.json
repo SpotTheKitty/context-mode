@@ -1,5 +1,8 @@
 {
   "fileTimeoutSeconds": 3600,
+  "fileTimeoutSecondsByFile": {
+    "prd10-hook-fuzz.test.mjs": 5400
+  },
   "nodeArgs": [
     "--test",
     "--test-concurrency=1",
@@ -12,7 +15,9 @@
     "announceMs": 30000,
     "maxWaitMs": 3600000,
     "maxHoldMs": 7200000,
-    "partialFileMs": 10000
+    "partialFileMs": 10000,
+    "leaseReserveMs": 60000,
+    "maxFilesPerLease": 0
   },
   "ignoredDirectories": [
     ".git",

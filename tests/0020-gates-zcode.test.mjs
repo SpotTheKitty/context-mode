@@ -8,9 +8,10 @@ import path from "node:path";
 import { TOOL_ORDER, EXEC_TIMEOUT_MS } from "../src/core/contracts/constants.ts";
 import { generateManifests } from "../build/manifests.ts";
 import { runDoctor, runSetup } from "../src/setup/index.ts";
-import { SETUP_NODE } from "../src/setup/registry.ts";
+import { SETUP_NODE, buildRegistry, configEdits, renderSkill } from "../src/setup/registry.ts";
 import { getAdapter } from "../src/adapters/table.ts";
 import { composeMatcher } from "../src/core/ops/doctor-config.ts";
+import { editHostConfigText } from "../src/core/ops/host-config.ts";
 
 // serial: every test spawns a doctor MCP probe with a fixed answer timeout; parallel probes starve each other
 describe("ADR-0020: zcode gate (D-NI-ZCODE-GATE-1)", () => {
@@ -53,9 +54,48 @@ createInterface({ input: process.stdin }).on("line", (l) => {
   const cfg = (home) => JSON.parse(readFileSync(file(home), "utf8"));
   const put = (home, doc) => writeFileSync(file(home), JSON.stringify(doc, null, 2));
 
-  async function doctorAfterSetup(t, edit) {
+  // T225: these cases test config validation, not setup's runtime verification.
+  // A failed setup can roll back config.json; ignoring that result made the
+  // ui.locale case throw ENOENT before it reached the intended assertion.
+  function seedSchemaFixture(s) {
+    const row = buildRegistry(s).find((r) => r.id === "zcode");
+    assert.ok(row?.config);
+    assert.equal(row.hookInstall.kind, "file");
+    assert.equal(row.hookInstall.file, row.config.file);
+    assert.equal(row.skillInstall.kind, "dir");
+    const wanted = configEdits(row.config);
+    const addShape = (keys, value) => {
+      if (value !== null && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length) {
+        for (const [key, child] of Object.entries(value)) addShape([...keys, key], child);
+      } else wanted.push([keys, value]);
+    };
+    for (const [key, value] of Object.entries(row.hookInstall.shape)) addShape([key], value);
+    const writeFixture = (target, text) => {
+      const relative = path.relative(s.home, target);
+      assert.ok(relative && !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`), target);
+      mkdirSync(path.dirname(target), { recursive: true });
+      writeFileSync(target, text);
+    };
+    writeFixture(row.config.file, editHostConfigText("zcode", row.config.file, "", row.config.format, wanted).text);
+    for (const skill of row.skillInstall.files) {
+      writeFixture(skill.file, renderSkill(readFileSync(skill.src, "utf8"), row.skillInstall.prefixes));
+    }
+  }
+
+  async function doctorAfterSetup(t, edit, setupServerSource) {
     const s = sandbox(t);
-    await runSetup({ home: s.home, pkgDir: s.pkgDir, env: s.env, agents: ["zcode"], runId: "z" });
+    const serverFile = path.join(s.pkgDir, "server.mjs");
+    const originalServer = readFileSync(serverFile, "utf8");
+    if (setupServerSource !== undefined) writeFileSync(serverFile, setupServerSource);
+    try {
+      if (edit) seedSchemaFixture(s);
+      else {
+        const setupResult = await runSetup({ home: s.home, pkgDir: s.pkgDir, env: s.env, agents: ["zcode"], runId: "z" });
+        assert.equal(setupResult.exitCode, 0, JSON.stringify(setupResult));
+      }
+    } finally {
+      if (setupServerSource !== undefined) writeFileSync(serverFile, originalServer);
+    }
     if (edit) { const doc = cfg(s.home); edit(doc); put(s.home, doc); }
     const d = await runDoctor({ home: s.home, pkgDir: s.pkgDir, env: s.env, agents: ["zcode"] });
     return d.agents[0];
@@ -92,6 +132,14 @@ createInterface({ input: process.stdin }).on("line", (l) => {
       assert.ok(c.detail.includes("config.json"), c.detail);
     });
   }
+
+  test("T225 Zcode schema fixture is independent of setup transport verification", async (t) => {
+    const a = await doctorAfterSetup(t, (d) => { d.ui = { locale: 12345 }; }, "process.exit(1);\n");
+    assert.equal(a.status, "FAIL", JSON.stringify(a));
+    assert.equal(reg(a).ok, false);
+    assert.ok(reg(a).detail.includes("ui.locale"), reg(a).detail);
+    assert.ok(reg(a).detail.includes("config.json"), reg(a).detail);
+  });
 
   test("D-NI-ZCODE-GATE-1: hooks.enabled=false FAILs doctor", async (t) => {
     const a = await doctorAfterSetup(t, (d) => { d.hooks.enabled = false; });

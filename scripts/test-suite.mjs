@@ -5,7 +5,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { acquireLock, LockWaitTimeout } from "./test-lock.mjs";
+import { acquireLock, leaseNeedsRotation, LockWaitTimeout } from "./test-lock.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const args = process.argv.slice(2);
@@ -15,9 +15,15 @@ if (!Array.isArray(policy.nodeArgs) || !policy.nodeArgs.every((arg) => typeof ar
 if (typeof policy.lock?.fileName !== "string" || !policy.lock.fileName || path.basename(policy.lock.fileName) !== policy.lock.fileName) throw new Error("lock fileName must be a basename");
 for (const [key, value] of Object.entries(policy.lock)) if (key !== "fileName" && (!Number.isFinite(value) || value < 0)) throw new Error(`invalid lock policy ${key}`);
 const testsDir = path.resolve(option("--tests-dir", path.join(root, "tests")));
-const fileTimeout = Number(option("--timeout-ms", policy.fileTimeoutSeconds * 1000));
-if (!Number.isFinite(fileTimeout) || fileTimeout <= 0) throw new Error("file timeout must be positive");
-const totals = { files: 0, tests: 0, suites: 0, pass: 0, fail: 0, cancelled: 0, skipped: 0, todo: 0, e2eSuitesSkipped: 0, fileFailures: 0, timeouts: 0 };
+const timeoutOverride = option("--timeout-ms", undefined);
+function budgetForFile(file) {
+  const seconds = policy.fileTimeoutSecondsByFile?.[file.split(path.sep).join("/")] ?? policy.fileTimeoutSeconds;
+  const budget = Number(timeoutOverride ?? seconds * 1000);
+  if (!Number.isFinite(budget) || budget <= 0) throw new Error(`file timeout must be positive: ${file}`);
+  return budget;
+}
+const fileTimeout = budgetForFile("generated-source");
+const totals = { files: 0, tests: 0, suites: 0, pass: 0, fail: 0, cancelled: 0, skipped: 0, todo: 0, e2eSuitesSkipped: 0, fileFailures: 0, timeouts: 0, leaseRotations: 0 };
 let expectedFiles = 0;
 let interrupted = false;
 let stopChild;
@@ -35,7 +41,7 @@ function kill(child) {
 }
 
 function run(file, commandArgs, cwd, budget) {
-  console.log(`FILE START ${file}`);
+  console.log(`FILE START ${file} budgetMs=${budget}`);
   return new Promise((resolve) => {
     const env = { ...process.env, FORCE_COLOR: "0" };
     delete env.NODE_TEST_CONTEXT; // A fixture runner is a new test run, not a recursive node:test worker.
@@ -73,9 +79,30 @@ try {
   const rules = { ...policy.lock };
   if (process.env.TEST_LOCK_WAIT_SECONDS) rules.maxWaitMs = Number(process.env.TEST_LOCK_WAIT_SECONDS) * 1000;
   console.log(`FULL SUITE QUEUE pid=${process.pid} cwd=${process.cwd()}`);
-  lock = await acquireLock({ dir: option("--lock-dir", process.env.TEST_LOCK_DIR || tmpdir()), rules, cwd: process.cwd(), log: console.log,
-    sleep: async (ms) => { if (interrupted) throw new Error("suite interrupted while waiting for lock"); await new Promise((resolve) => setTimeout(resolve, ms)); if (interrupted) throw new Error("suite interrupted while waiting for lock"); } });
-  if (interrupted) throw new Error("suite interrupted before test files started");
+  const lockDir = option("--lock-dir", process.env.TEST_LOCK_DIR || tmpdir());
+  const lockSleep = async (ms) => {
+    if (interrupted) throw new Error("suite interrupted while waiting for lock");
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    if (interrupted) throw new Error("suite interrupted while waiting for lock");
+  };
+  let leaseFiles = 0;
+  const take = async () => {
+    lock = await acquireLock({ dir: lockDir, rules, cwd: process.cwd(), log: console.log, sleep: lockSleep });
+    leaseFiles = 0;
+    if (interrupted) throw new Error("suite interrupted before test files started");
+  };
+  const reserveLease = async (file, budget) => {
+    const cleanupBudgetMs = policy.cleanupTimeoutSeconds * 1000;
+    if (budget + cleanupBudgetMs + (rules.leaseReserveMs ?? 0) >= rules.maxHoldMs) throw new Error(`file budget and cleanup must fit the shared lock hold limit: ${file}`);
+    if (!leaseNeedsRotation({ heldMs: Date.now() - lock.acquiredAtMs, completedFiles: leaseFiles, fileBudgetMs: budget, cleanupBudgetMs, rules })) return;
+    // run() has returned: no test child is active while the shared lock is free.
+    console.log(`FULL SUITE LOCK YIELD before ${file} after ${leaseFiles} completed files`);
+    lock.release(); lock = undefined;
+    await lockSleep(rules.pollMs);
+    await take();
+    totals.leaseRotations++;
+  };
+  await take();
   const files = [];
   const visit = (dir) => { for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (entry.isDirectory() && !policy.ignoredDirectories.includes(entry.name)) visit(path.join(dir, entry.name));
@@ -88,12 +115,16 @@ try {
   if (!files.length) throw new Error(`no test files in ${testsDir}`);
   console.log(`FULL SUITE START files=${files.length} fileTimeoutMs=${fileTimeout} lock=${lock.path}`);
   if (!args.includes("--no-build")) {
+    await reserveLease("generated-source", fileTimeout);
     const build = await run("generated-source", [path.join(root, "build/build.mjs"), "--generated-only"], root, fileTimeout);
     if (build.code !== 0) throw new Error(`generated source failed: ${build.code}`);
   }
   for (const name of files) {
     if (interrupted) break;
-    const result = await run(name, [...policy.nodeArgs, path.join(testsDir, name)], process.cwd(), fileTimeout);
+    const budget = budgetForFile(name);
+    await reserveLease(name, budget);
+    const result = await run(name, [...policy.nodeArgs, path.join(testsDir, name)], process.cwd(), budget);
+    leaseFiles++;
     const c = counts(result.output);
     totals.files++;
     totals.e2eSuitesSkipped += [...result.output.matchAll(/# e2e: requires installed agent clients/gu)].length;

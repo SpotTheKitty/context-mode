@@ -72,3 +72,5 @@ follow-up keeps the workstation runtime pin at 645d7ca1 as requested; no runtime
 was deployed from the checkout cleanup changes.
 
 A second framed-transport fixture sends a notification and an unrelated response before the matching hooks.discover reply. The former first-frame parser returned undefined. Discovery now consumes complete frames until the matching request id; its API and deadline remain unchanged. Reference: https://www.jsonrpc.org/specification .
+
+Long Windows unit runs hand off the existing T202 lock between completed files before its maximum hold could expire; they reacquire before starting another file. The shared record format and other checkouts are unchanged. Zcode schema fixtures are initialized from declarative registry data so setup rollback after an unrelated runtime probe cannot erase their input. See TEST-LAYOUT.md for budgets, compatibility and regression evidence.
