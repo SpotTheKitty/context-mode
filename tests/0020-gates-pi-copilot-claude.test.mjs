@@ -330,7 +330,11 @@ createInterface({ input: process.stdin }).on("line", (l) => {
         const hooks = await listCopilotHooks({ ...s.env, STUB_HOLD_OPEN: "1", STUB_PID_FILE: pidFile }, s.hookFile, s.home);
         assert.ok(hooks?.some((h) => h.event === "preToolUse"), "the framed fixture reply was parsed");
         pid = Number(readFileSync(pidFile, "utf8"));
-        for (let i = 0; i < 20 && alive(); i++) await new Promise((r) => setTimeout(r, 50));
+        // killTree deliberately returns before Windows taskkill completes (D-1337-EXIT-SETTLE-1).
+        // A one-second observation raced process startup under load; bound cleanup separately
+        // from the discovery deadline, as the Windows grandchild check does.
+        const cleanupDeadline = Date.now() + 30_000;
+        while (alive() && Date.now() < cleanupDeadline) await new Promise((r) => setTimeout(r, 100));
         assert.equal(alive(), false, "discovery left a shim descendant alive holding its stdout pipe; the test file cannot exit");
       } finally {
         if (pid === undefined && existsSync(pidFile)) pid = Number(readFileSync(pidFile, "utf8"));
