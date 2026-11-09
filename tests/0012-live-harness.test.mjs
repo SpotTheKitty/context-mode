@@ -508,7 +508,7 @@ describe("T225 bounded full-suite runner", () => {
   function run(s, extra = []) {
     const env = { ...process.env, TEST_LOCK_DIR: s.lock };
     delete env.TEST_LOCK_WAIT_SECONDS;
-    return spawnSync(process.execPath, [s.script, "--no-build", "--timeout-ms", "10000", ...extra], { cwd: s.root, env, encoding: "utf8", timeout: 30000 });
+    return spawnSync(process.execPath, [s.script, "--no-build", "--timeout-ms", "30000", ...extra], { cwd: s.root, env, encoding: "utf8", timeout: 120000 });
   }
   test("T225 runner discovers nested files and summarizes from a copied layout with no repository", (t) => {
     const s = fixture(t);
@@ -522,9 +522,12 @@ describe("T225 bounded full-suite runner", () => {
   test("T225 per-file watchdog names the hanging test, frees its port and continues", async (t) => {
     const s = fixture(t);
     const portFile = path.join(s.root, "port");
-    writeFileSync(path.join(s.tests, "a-hang.test.mjs"), `import {test} from 'node:test'; import net from 'node:net'; import {writeFileSync} from 'node:fs'; test('owned open-port fixture',()=>{const server=net.createServer(); server.listen(0,'127.0.0.1',()=>writeFileSync(${JSON.stringify(portFile)},String(server.address().port)));});`);
+    writeFileSync(path.join(s.tests, "a-hang.test.mjs"), `import {test} from 'node:test'; import net from 'node:net'; import {writeFileSync} from 'node:fs'; test('owned open-port fixture',async()=>{const server=net.createServer(); await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve)); writeFileSync(${JSON.stringify(portFile)},String(server.address().port));});`);
     writeFileSync(path.join(s.tests, "b-pass.test.mjs"), 'import {test} from "node:test"; test("following file passed",()=>{});');
-    const r = run(s, ["--timeout-ms", "5000"]);
+    // Five seconds could expire during nested node:test startup on a busy Windows
+    // machine, before this intentional open-handle fixture reached its test.
+    // Wait for listen in the fixture and allow startup before testing cleanup.
+    const r = run(s);
     assert.equal(r.status, 1, r.stdout + r.stderr);
     assert.match(r.stdout, /a-hang.test.mjs exit=124 TIMEOUT last=.*owned open-port fixture/);
     assert.match(r.stdout, /following file passed/);

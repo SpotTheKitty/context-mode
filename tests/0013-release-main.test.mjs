@@ -1,6 +1,6 @@
 // ADR-0013 (release automation), PRD-v2 section 14: release to main. One file per ADR area (ADR-0024); one describe per script.
 // Moved from tests/release/{publish,plan-main,commit-main,branch-protection,release-next}. Names and assertions unchanged.
-import { describe, test } from "node:test";
+import { beforeEach, describe, test } from "node:test";
 import { CONC } from "./_lib/concurrency.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -9,6 +9,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROTECTION_ENDPOINT, SETTINGS, protectionDrift } from "../scripts/release/branch-protection.mjs";
+
+// These local Git fixtures use synchronous subprocesses. Yield between cases so
+// node:test can flush spec progress instead of looking stuck until the file ends.
+beforeEach(() => new Promise((resolve) => setImmediate(resolve)));
 
 describe("ADR-0013: plan.mjs on main", { concurrency: CONC }, () => {
   // Main-only release plan (docs/architecture/release/MAIN-ONLY.md, owner decision 2026-10-28): `plan.mjs --main --channel next|latest`

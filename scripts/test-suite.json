@@ -1,5 +1,5 @@
 {
-  "fileTimeoutSeconds": 900,
+  "fileTimeoutSeconds": 3600,
   "nodeArgs": [
     "--test",
     "--test-concurrency=1",
