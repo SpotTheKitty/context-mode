@@ -551,4 +551,21 @@ describe("T225 bounded full-suite runner", () => {
     assert.match(r.stdout + r.stderr, new RegExp(`held by pid ${process.pid}`));
     assert.equal(JSON.parse(readFileSync(lockFile, "utf8")).pid, process.pid);
   });
+  test("T225 queued lock hold budget starts at acquisition", async (t) => {
+    const s = fixture(t);
+    const { acquireLock } = await import("../scripts/test-lock.mjs");
+    const rules = JSON.parse(readFileSync(path.join(s.root, "scripts", "test-suite.json"), "utf8")).lock;
+    Object.assign(rules, { maxHoldMs: 1000, maxWaitMs: 1000, pollMs: 1 });
+    const lockFile = path.join(s.lock, rules.fileName);
+    let clock = 100000;
+    writeFileSync(lockFile, JSON.stringify({ pid: 111, startedAt: new Date(clock).toISOString(), cwd: s.root }));
+    const holder = await acquireLock({ dir: s.lock, rules, pid: 222, cwd: s.root,
+      now: () => clock, isAlive: () => true,
+      sleep: async () => { clock += 600; fs.unlinkSync(lockFile); } });
+    t.after(() => holder.release());
+    clock += 500; // 1.1 s since queuing, but only 0.5 s of the 1 s hold budget.
+    await assert.rejects(acquireLock({ dir: s.lock, rules: { ...rules, maxWaitMs: 0 }, pid: 333,
+      now: () => clock, isAlive: () => true }), { name: "LockWaitTimeout" });
+    assert.equal(JSON.parse(readFileSync(lockFile, "utf8")).pid, 222);
+  });
 });

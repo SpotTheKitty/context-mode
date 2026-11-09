@@ -61,6 +61,8 @@ async function acquireLock(options) {
     try {
       const fd = openSync(path, "wx");
       try {
+        // The shared protocol uses startedAt to bound ownership, not queue age.
+        mine.startedAt = new Date(now()).toISOString();
         writeSync(fd, JSON.stringify(mine));
       } finally {
         closeSync(fd);
