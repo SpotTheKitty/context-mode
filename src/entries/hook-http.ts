@@ -22,7 +22,7 @@ export function injectWorkspace(out: HookOutput, raw: unknown, agent: AgentId, p
     const body = out.stdout ? JSON.parse(out.stdout) : {};
     const specific = body.hookSpecificOutput ?? {};
     if (out.exitCode !== 0 || specific.permissionDecision === "deny") return out;
-    body.hookSpecificOutput = {...specific, hookEventName:"PreToolUse", updatedInput:{...toolInput,...specific.updatedInput,_workspace:input.cwd}};
+    body.hookSpecificOutput = {...specific, hookEventName:"PreToolUse", updatedInput:{...toolInput,...specific.updatedInput,_workspace:specific.updatedInput?._workspace ?? input.cwd}};
     return {...out,stdout:JSON.stringify(body)};
   } catch {return out;}
 }
