@@ -19,7 +19,8 @@ import { serveSearchWorker, stallSync } from "./search-worker.ts";
 
 export interface HttpConfig {
   host: string; port: number; path: string; tenantHeader: string; dataDir: string;
-  maxRequestBytes: number; tenants: Record<string, {agent: AgentId; toolPrefix?: string; hookAdapters?: Record<string,{toolPrefix?:string}>}>;
+  defaultWorkspace?: string; sessionRoot?: string;
+  maxRequestBytes: number; tenants: Record<string, {agent: AgentId; defaultWorkspace?: string; toolPrefix?: string; hookAdapters?: Record<string,{toolPrefix?:string}>}>;
   /** T230: budget for one ctx_search, queue wait included. Default SEARCH_TIMEOUT_MS. */
   searchTimeoutMs?: number;
   /** T230: worker threads that run searches. Default SEARCH_WORKERS; 0 runs a search on the request path (no bound). */
@@ -101,7 +102,9 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
             const args = {...input as Record<string,unknown>};
             const meta = req.mcpReq._meta as Record<string,unknown> | undefined;
             const sandbox = meta?.["codex/sandbox-state-meta"] as {sandboxCwd?:string} | undefined;
-            let workspace = args._workspace ?? meta?.cwd ?? sandbox?.sandboxCwd ?? args.cwd;
+            const explicitWorkspace = args._workspace ?? meta?.cwd ?? sandbox?.sandboxCwd ?? args.cwd;
+            const fallback = explicitWorkspace === undefined;
+            let workspace = explicitWorkspace ?? config.tenants[tenant]!.defaultWorkspace ?? config.defaultWorkspace ?? config.sessionRoot ?? process.cwd();
             if (typeof workspace === "string" && workspace.startsWith("file:")) workspace = (await import("node:url")).fileURLToPath(workspace);
             const sessionId = typeof args._sessionId === "string" ? args._sessionId : typeof meta?.sessionId === "string" ? meta.sessionId : "http";
             delete args._workspace; delete args._sessionId;
@@ -124,7 +127,7 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
               }
               const db = await openDb(project);
               try {appendEvent(db,ownCallRow(project,ctx,tool.name,reply));} finally {closeDb(db);}
-              return {content:[{type:"text" as const,text:reply.text}],isError:reply.isError};
+              return {content:[{type:"text" as const,text:(fallback ? `Workspace fallback: ${workspace}. Pass _workspace for project-specific results.\n` : "") + reply.text}],isError:reply.isError};
             } catch (e) {return {content:[{type:"text" as const,text:e instanceof Error ? e.message : "HTTP tool failed"}],isError:true};}
           });
         }
@@ -150,7 +153,8 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
 if (!isMainThread && (workerData as {role?: string} | null)?.role === SEARCH_WORKER_ROLE) {
   serveSearchWorker();
 } else if (isMainThread && process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const config = JSON.parse(readFileSync(process.argv[2]!,"utf8")).contextMode as HttpConfig;
+  const table = JSON.parse(readFileSync(process.argv[2]!,"utf8"));
+  const config = {...table.contextMode, sessionRoot:table.contextMode.sessionRoot ?? table.sessionLog?.sessionRoot} as HttpConfig;
   const host = await listenHttp(config);
   console.error(JSON.stringify({event:"listening",pid:process.pid,parentPid:process.ppid,address:host.address(),instance:randomUUID()}));
 }

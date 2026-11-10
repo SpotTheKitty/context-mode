@@ -9,6 +9,23 @@ export interface HookHttpConfig {
   dataDir: string; host: string; port: number; path: string; tenantHeader: string; hookTimeoutMs: number;
   tenants: Record<string,{agent:AgentId;toolPrefix?:string;hookAdapters?:Record<string,{toolPrefix?:string}>}>;
 }
+// Claude's native PreToolUse contract supports updatedInput. Preserve routing decisions
+// and all other hook output; only add missing workspace metadata to our own tools.
+export function injectWorkspace(out: HookOutput, raw: unknown, agent: AgentId, prefix = "mcp__contextMode__"): HookOutput {
+  if (agent !== "claude-code" || !raw || typeof raw !== "object") return out;
+  const input = raw as Record<string, unknown>;
+  if (input.hook_event_name !== "PreToolUse" || typeof input.cwd !== "string" || !input.cwd ||
+      typeof input.tool_name !== "string" || !input.tool_name.startsWith(prefix + "ctx_")) return out;
+  const toolInput = input.tool_input as Record<string, unknown> | undefined;
+  if (!toolInput || typeof toolInput !== "object" || toolInput._workspace !== undefined) return out;
+  try {
+    const body = out.stdout ? JSON.parse(out.stdout) : {};
+    const specific = body.hookSpecificOutput ?? {};
+    if (out.exitCode !== 0 || specific.permissionDecision === "deny") return out;
+    body.hookSpecificOutput = {...specific, hookEventName:"PreToolUse", updatedInput:{...toolInput,...specific.updatedInput,_workspace:input.cwd}};
+    return {...out,stdout:JSON.stringify(body)};
+  } catch {return out;}
+}
 
 export async function forwardHook(config: HookHttpConfig, tenant: string, raw: unknown, adapter?: AgentId): Promise<HookOutput> {
   const identity = config.tenants[tenant];
@@ -23,14 +40,14 @@ export async function forwardHook(config: HookHttpConfig, tenant: string, raw: u
     if (!response.ok) throw new Error("HTTP hook status " + response.status);
     const out = await response.json() as HookOutput;
     if (typeof out.stdout !== "string" || (out.exitCode !== 0 && out.exitCode !== 2) || (out.stderr !== undefined && typeof out.stderr !== "string")) throw new Error("invalid native hook response");
-    return out;
+    return injectWorkspace(out,raw,agent,identity.toolPrefix);
   } catch (err) {
     logHookError({CONTEXT_MODE_DATA_DIR:config.dataDir},agent,"http",err);
     const row = getAdapter(agent);
     let event: ReturnType<typeof row.decode>["event"] = "PreToolUse";
     try {event=row.decode(raw).event;} catch { /* Empty allow also permits malformed native inputs. */ }
-    return {...row.encode({event,agent,sessionId:"",cwd:"",turn:0},{kind:"allow"}),
-      stderr:"context-mode HTTP hook unavailable; allowed"};
+    return injectWorkspace({...row.encode({event,agent,sessionId:"",cwd:"",turn:0},{kind:"allow"}),
+      stderr:"context-mode HTTP hook unavailable; allowed"},raw,agent,identity.toolPrefix);
   }
 }
 
