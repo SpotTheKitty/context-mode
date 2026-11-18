@@ -15,6 +15,7 @@ import type { ProjectContext, ProjectSourceKind } from "../contracts/types.ts";
 import { resolveConfigDir } from "./config-dir.ts";
 import { commonRoot } from "./contain.ts";
 import { sha256Hex } from "./sha256.ts";
+import { httpScope } from "../store/http-scope.ts";
 
 export interface ProjectSourceInput {
   env: NodeJS.ProcessEnv;
@@ -171,11 +172,15 @@ export function resolveProject(agent: AgentId, src: ProjectSourceInput): Project
       return key;
     },
     get projectDir(): string {
+      const scope = httpScope.getStore();
+      if (scope) return dirname(scope.database);
       // D-M1-T3-5: the config dir comes from the process env, not src.env (src.env picks the project only).
       pdir ??= join(resolveConfigDir(process.env), PROJECTS_DIR_NAME, this.projectKey);
       return pdir;
     },
     get dbPath(): string {
+      const scope = httpScope.getStore();
+      if (scope) return scope.database;
       return join(this.projectDir, DB_FILE_NAME);
     },
     worktree,

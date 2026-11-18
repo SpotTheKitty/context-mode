@@ -177,6 +177,7 @@ describe("ADR-0015 repo: removed-file gate (allow-list)", () => {
     "src/adapters/pi.ts": "x", "src/adapters/opencode.ts": "x",
     "tests/0001-a.test.mjs": "x", "tests/_lib/a.mjs": "x", "e2e/cases/a.mjs": "x", "build/build.mjs": "x", "bench/a.mjs": "x",
     "docs/architecture/TECH-SPEC.md": "x", "docs/install/README.md": "x", "docs/tools.md": "x", "docs/UPSTREAM-CREDITS.md": "x",
+    "scripts/test-suite.mjs": "x", "scripts/test-suite.json": "{}", "scripts/test-lock.mjs": "x",
     "scripts/gate.mjs": "x", "scripts/ci-gs4-lint.mjs": "x", "scripts/record-fixtures.mjs": "x", "scripts/release/plan.mjs": "x",
     ".github/workflows/ci.yml": "x",
     ".claude/settings.json": "{}", ".claude-plugin/plugin.json": "{}", ".codex-plugin/mcp.json": "{}",

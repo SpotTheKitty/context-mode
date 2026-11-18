@@ -1,4 +1,4 @@
-// PRD-v2 section 10 (hooks never error). One file on purpose: the seeded hook fuzz is the long pole of the parallel run (ADR-0024).
+// PRD-v2 section 10 (hooks never error). One file on purpose: seeded hook fuzz is the long pole of the full run (ADR-0024).
 // Moved from tests/hooks/hook-fuzz.test.mjs. Test names and bodies unchanged.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -21,14 +21,21 @@ describe("PRD-v2 section 10: seeded hook fuzz on every host", () => {
   //   3. a ctx_* tool of the host is never denied;
   //   4. the call ends inside HOOK_TIMEOUT_MS (the host timeout of the hook config).
   // CM_FUZZ_N sets the cases per host (default 500, the CI size). CM_FUZZ_SEED_EXTRA adds one more seed for a local run.
+  // T225: ten 500-case matrices create 5,000 fresh processes on Windows. The
+  // runner policy gives this whole file 90 minutes; HOOK_TIMEOUT_MS per call,
+  // every seed/case, and the one-child Windows pool remain unchanged.
   // Seeds are fixed, so a red run reproduces: the failure text prints host, seed, index and the stdin bytes.
-  // Serial on purpose: the shared before/after build one bundle and one temp root, COUNT and slow are shared, and each host test already runs a pool sized to the cores.
+  // Serial on purpose: before/after share one bundle and temp root, COUNT and slow;
+  // each host uses the platform's bounded pool below.
   const REPO = join(import.meta.dirname, "..");
   const BUNDLE_DIR = join(REPO, "release-out");
   const SEEDS = [1, 7, 42, 1337, 2026, 9001, 31337, 65521];
   const N = Number(process.env.CM_FUZZ_N ?? 500);
   const SEED_LIST = process.env.CM_FUZZ_SEED_EXTRA ? [...SEEDS, Number(process.env.CM_FUZZ_SEED_EXTRA)] : SEEDS;
-  const WIDTH = Math.max(2, Math.min(6, cpus().length - 1));
+  // T225: Windows process startup competes with the six-child pool itself;
+  // cpu count is not available scheduling capacity. Keep every case and the real
+  // hook deadline, but run one child at a time, as the Windows area tests do.
+  const WIDTH = process.platform === "win32" ? 1 : Math.max(2, Math.min(6, cpus().length - 1));
   const IS_WIN = process.platform === "win32";
 
   let root;

@@ -33,7 +33,7 @@ import { writeOwnerPid } from "../src/core/store/owners.ts";
 import { CtxError, formatError } from "../src/core/contracts/errors.ts";
 import { buildReport } from "../src/core/ops/report.ts";
 import { verifySums } from "../src/core/ops/verify-sums.ts";
-import { ctxDoctor, runDoctorChecks } from "../src/core/tools/doctor.ts";
+import { ctxDoctor, d1UpdateCommand, runDoctorChecks } from "../src/core/tools/doctor.ts";
 import { ctxUpgrade, runUpgrade } from "../src/core/tools/upgrade.ts";
 import { buildRegistry, hookRunsCheck, runSetup } from "../src/setup/index.ts";
 import { codexRunDirOf, codexSetupHomeOf } from "../src/core/project/config-dir.ts";
@@ -523,7 +523,7 @@ describe("ADR-0010 doctor D3 on Antigravity: one clear line, no Gemini CLI claim
     t.after(() => rmSync(dir, { recursive: true, force: true }));
     return dir;
   }
-  function run(home, clientName, bundleDir) {
+  function rows(home, clientName, bundleDir) {
     const projectDir = path.join(home, ".context-mode", "projects", KEY);
     const ctx = {
       project: { projectKey: KEY, projectDir, dbPath: path.join(projectDir, "context.db"), worktree: home, containmentRoot: home, agent: "gemini", source: getAdapter("gemini").projectSource },
@@ -531,8 +531,9 @@ describe("ADR-0010 doctor D3 on Antigravity: one clear line, no Gemini CLI claim
       ...(clientName === undefined ? {} : { clientInfo: { name: clientName, version: "1.0.0" } }),
     };
     const host = { env: { HOME: home, USERPROFILE: home, PATH: process.env.PATH ?? "" }, bundleDir: bundleDir ?? path.join(home, "no-bundle"), piCwd: undefined };
-    return runDoctorChecks(ctx, getAdapter("gemini"), host).then((rows) => rows.find((r) => r.id === "D3"));
+    return runDoctorChecks(ctx, getAdapter("gemini"), host);
   }
+  const run = (home, clientName, bundleDir) => rows(home, clientName, bundleDir).then((rs) => rs.find((r) => r.id === "D3"));
 
   test("[D-1340-AGY-D3-1] the reporter's layout (plugin under ~/.gemini/config/plugins/context-mode) gets the Antigravity line, not wrong entries", async (t) => {
     const home = tmp(t);
@@ -555,6 +556,16 @@ describe("ADR-0010 doctor D3 on Antigravity: one clear line, no Gemini CLI claim
       assert.ok(d3.detail.includes("hooks are not checked"), d3.detail);
     });
   }
+
+  test("[D-1340-AGY-D1-1] D1 in Antigravity never names the Gemini update command", () => {
+    const env = { HOME: "/h", USERPROFILE: "/h" };
+    const agy = unsupportedHostOf({ clientName: "antigravity-cli" });
+    assert.ok(agy, "antigravity-cli is a known unsupported host");
+    const fix = d1UpdateCommand("gemini", env, agy);
+    assert.equal(fix.includes("gemini extensions update"), false, fix);
+    assert.ok(fix.includes("Antigravity is not a supported host today"), fix);
+    assert.ok(d1UpdateCommand("gemini", env, undefined).includes("gemini extensions update"), "a real Gemini host keeps its own command");
+  });
 
   test("[D-1340-AGY-D3-1] the CLI plugin dir ~/.gemini/antigravity-cli/plugins is Antigravity too", async (t) => {
     const home = tmp(t);
@@ -2446,7 +2457,7 @@ describe("ADR-0010 ctx_upgrade tool", { concurrency: CONC }, () => {
     const cfg = path.join(home, "Library", "Application Support", "orca", "claude-profiles", "7f3a9c", "cfg");
     mkdirSync(cfg, { recursive: true });
     const reply = await runUpgrade({}, deps(home, "claude-code", { env: { HOME: home, USERPROFILE: home, PATH: "", CLAUDE_CONFIG_DIR: cfg } }));
-    const q = `CLAUDE_CONFIG_DIR='${cfg}' `;
+    const q = process.platform === "win32" ? "" : `CLAUDE_CONFIG_DIR='${cfg}' `; // claudeProfileEnv adds no words on Windows (POSIX quoting only)
     assert.ok(reply.text.includes(`| host update |  | ${q}claude plugin marketplace update context-mode && ${q}claude plugin update context-mode@context-mode |`), reply.text);
   });
 
@@ -2457,7 +2468,7 @@ describe("ADR-0010 ctx_upgrade tool", { concurrency: CONC }, () => {
     assert.equal(hostUpdateCommand("claude-code", {}, "darwin"), C.UPGRADE_HOST_COMMAND["claude-code"]);
     assert.equal(hostUpdateCommand("opencode", { CLAUDE_CONFIG_DIR: "/p/cfg" }, "darwin"), C.UPGRADE_HOST_COMMAND.opencode);
     const doctorSrc = readFileSync(new URL("../src/core/tools/doctor.ts", import.meta.url), "utf8");
-    assert.ok(doctorSrc.includes("updateCommand: hostUpdateCommand(adapter.id, env)"));
+    assert.ok(doctorSrc.includes("hostUpdateCommand(agent, env)"), "D1 still reaches hostUpdateCommand through d1UpdateCommand");
   });
 
   test("[M5] upgrade/opencode-release-git-entry-becomes-npm-latest, siblings kept (#1309)", async (t) => {

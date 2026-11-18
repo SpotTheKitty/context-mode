@@ -1,6 +1,6 @@
 {
   "name": "context-mode",
-  "version": "2.1.6",
+  "version": "2.1.7",
   "type": "module",
   "description": "Context window saver for 10 coding agents. Local and free: sandboxed code execution, FTS5 search, session continuity.",
   "author": "Mert Koseoglu",
@@ -31,6 +31,7 @@
     "url": "https://github.com/mksglu/context-mode/issues"
   },
   "scripts": {
+    "test": "node scripts/test-suite.mjs",
     "build": "node build/build.mjs --out release-out",
     "build:release": "node build/build.mjs --out release-out",
     "typecheck": "tsc --noEmit",
@@ -50,5 +51,8 @@
   },
   "engines": {
     "node": ">=24.15.0"
+  },
+  "allowScripts": {
+    "esbuild@0.24.0": true
   }
 }

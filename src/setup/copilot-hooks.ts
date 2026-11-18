@@ -8,6 +8,7 @@ import { realpathSync } from "node:fs";
 import path from "node:path";
 
 import { spawnForm, whichBin } from "./spawn-bin.ts";
+import { killTree } from "../core/sandbox/kill.ts";
 
 type Json = Record<string, unknown>;
 const isObj = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -65,15 +66,19 @@ export function listCopilotHooks(env: Record<string, string | undefined>, file: 
   return new Promise((resolve) => {
     let f;
     try { f = spawnForm(bin, ["--server", "--stdio", "--no-auto-update"], env as NodeJS.ProcessEnv); } catch { resolve(undefined); return; }
-    const child = spawn(f.command, f.args, { env: env as NodeJS.ProcessEnv, cwd, stdio: ["pipe", "pipe", "ignore"], windowsVerbatimArguments: f.windowsVerbatimArguments, windowsHide: true });
+    const child = spawn(f.command, f.args, { env: env as NodeJS.ProcessEnv, cwd, stdio: ["pipe", "pipe", "ignore"], detached: process.platform !== "win32", windowsVerbatimArguments: f.windowsVerbatimArguments, windowsHide: true });
     let buf: Buffer = Buffer.alloc(0);
+    const requestId = 1;
     let done = false;
     const finish = (v: CopilotHook[] | undefined): void => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       child.stdin.destroy();
-      child.kill();
+      // T225: killing a Windows command shim alone leaves its server descendant
+      // holding stdout open. Close our reader and stop the whole owned tree.
+      child.stdout.destroy();
+      if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) killTree(child.pid);
       resolve(v);
     };
     const timer = setTimeout(() => finish(undefined), ASK_TIMEOUT_MS);
@@ -81,16 +86,22 @@ export function listCopilotHooks(env: Record<string, string | undefined>, file: 
     child.on("close", () => finish(undefined));
     child.stdin.on("error", () => finish(undefined));
     child.stdout.on("data", (d: Buffer) => {
+      if (done) return;
       buf = Buffer.concat([buf, d]);
-      const m = frame(buf);
-      if (!m) return;
-      buf = Buffer.from(m.rest);
-      let reply: unknown;
-      try { reply = JSON.parse(m.body); } catch { finish(undefined); return; }
-      if (!isObj(reply) || !isObj(reply.result) || !Array.isArray(reply.result.hooks)) { finish(undefined); return; }
-      finish(copilotHooksFromReply(reply, file));
+      for (;;) {
+        const m = frame(buf);
+        if (!m) return;
+        buf = Buffer.from(m.rest);
+        let reply: unknown;
+        try { reply = JSON.parse(m.body); } catch { finish(undefined); return; }
+        // A notification or another request's response is not our answer.
+        if (!isObj(reply) || reply.id !== requestId) continue;
+        if (!isObj(reply.result) || !Array.isArray(reply.result.hooks)) { finish(undefined); return; }
+        finish(copilotHooksFromReply(reply, file));
+        return;
+      }
     });
-    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "hooks.discover", params: {} });
+    const body = JSON.stringify({ jsonrpc: "2.0", id: requestId, method: "hooks.discover", params: {} });
     try { child.stdin.write(`Content-Length: ${Buffer.byteLength(body)}${HEADER_END}${body}`); } catch { finish(undefined); }
   });
 }

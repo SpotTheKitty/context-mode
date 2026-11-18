@@ -36,7 +36,7 @@ Status: accepted 2026-10-30, move done. Decision record: [ADR-0024](adr/0024-tes
 | 0017-v1-retention | ADR-0017 | `tests/0017-v1-retention.test.mjs` | v1 vs v2 diff and the ported v1 executor and store tests | 37 | 20.4 |
 | 0018-contracts | ADR-0018 | `tests/0018-contracts.test.mjs` | module contracts and single-source hook file | 46 | 0.3 |
 | 0018-build | ADR-0018, ADR-0019, ADR-0023 | `tests/0018-build.test.mjs` | build, generated files, host manifests, npm package | 79 | 10.1 |
-| 0002-store | ADR-0002, PRD-v2 section 4, GP8, GP9 | `tests/0002-store.test.mjs` | single DB, schema, cleanup, checkpoint, owners, lifecycle exit | 63 | 8.5 |
+| 0002-store | ADR-0002, PRD-v2 section 4, GP8, GP9 | `tests/0002-store.test.mjs` | single DB, schema, cleanup, checkpoint, owners, lifecycle exit, HTTP fail-open and legacy import fallback | 79 | 8.5 |
 | 0007-identity | ADR-0007, PRD-v2 section 5, GP7 | `tests/0007-identity.test.mjs` | project and session identity, scope, containment, per-host home dirs | 86 | 6.4 |
 | 0007-mcp-server | ADR-0004, ADR-0005, ADR-0007, PRD-v2 sections 6-7 | `tests/0007-mcp-server.test.mjs` | MCP server, tool registry, call shapes, prompt delivery | 65 | 4.4 |
 | prd8-index-search | PRD-v2 section 8, GP5 | `tests/prd8-index-search.test.mjs` | chunking, index, FTS search, fetch, snippets | 201 | 8.3 |
@@ -75,3 +75,67 @@ Before: 242 unit files, 2624 test names, suite wall median 102 s (same machine, 
 ## Guard
 
 tests/0014-repo-hygiene.test.mjs (section ADR-0024) fails for every *.test.mjs under tests and every case file under e2e/cases that this table does not list by path. The e2e files that stay in place are listed by path in the e2e-gp-keep row.
+
+ADR-0002 store coverage also checks HTTP tenant/project isolation, native hook forwarding and fail-open transport errors, legacy import identity fallback and ownership overrides, and the flat bundled server deployment layout.
+
+## Bounded unit suite and real-host e2e (T225)
+
+`npm test` runs `scripts/test-suite.mjs`. It builds generated source, takes the
+T202-compatible workstation lock (`crew-runtime-tests.lock` in the temp directory),
+and runs every unit test file with the spec reporter, one file at a time. The
+lock uses `{pid, startedAt, cwd}`, exclusive creation, live-owner waiting, stale
+owner reclamation and owner-checked release. Limits and lock rules are data in
+`scripts/test-suite.json`; `--timeout-ms` overrides only the per-file watchdog.
+The M2 benchmark's own 60-second assertion and production hook deadlines remain
+unchanged. A watchdog reports the file and last completed test, terminates the
+owned process tree, and continues. Missing summaries and nonzero exits fail the
+run. The final `FULL SUITE` line aggregates the same run's native file summaries;
+`fileFailures` and `timeouts` separately identify incomplete files. Interrupted
+runs print `FULL SUITE PARTIAL`. `TEST_LOCK_DIR` and `TEST_LOCK_WAIT_SECONDS` use
+T202's meanings.
+
+`0020-fire-hook-config.test.mjs` and `0020-fire-plugin-ext.test.mjs` probe real
+installed clients, even though their providers and homes are temporary. They are
+opt-in e2e suites, named as skipped with the reason in the unit output. Set
+`CM_REAL_HOST_E2E=1` and use `node scripts/test-suite.mjs --file
+0020-fire-hook-config.test.mjs` (or the plugin/ext file) to run them. When enabled,
+the existing per-client checks still name a missing binary and its skip reason.
+The aggregate separately reports `e2eSuitesSkipped`, since Node's native leaf-test
+skip counter does not count a skipped describe that registers no children.
+
+The unit gates retain the synthetic Copilot command/framed-JSON fixture, including
+missing MCP registration, disabled hooks and re-enablement. A persistent stub
+server verifies discovery closes stdout and kills a Windows shim's descendant.
+The Kiro loader-event fixture shares its parser with the real e2e check; it checks
+registered/read counts and rejects missing or malformed acknowledgements. Kiro
+configuration/enabled-entry tests remain deterministic unit fixtures. These tests
+exercise the contracts without installing a client or using a machine home.
+
+The watchdog's process cleanup is separately bounded by cleanupTimeoutSeconds in the policy file. The runner prints its own PID before lock acquisition, and handled interrupts cancel lock waiting without releasing another process's lock. Discovery fixtures include notifications and unrelated response IDs before the requested response.
+
+The watchdog's synthetic open-port regression awaits the listening event before completing its test. Its artificial per-file budget is thirty seconds: five seconds expired during nested Node startup on a busy Windows machine before the fixture ran. The regression still requires the named test, one watchdog timeout, the next file's success, release of the owned port, and release of its isolated lock. This fixture allowance does not change the suite policy or production deadlines.
+
+The release fixture files yield to the event loop before each case. Their synchronous local Git/Node subprocesses previously prevented spec progress from flushing until the file ended, making active work look stalled. On this Windows host one representative fixture passed in 75 seconds (43 seconds with empty Git config); the complete release-main file was still advancing through fixture children when the initial fifteen-minute whole-file watchdog expired. The default whole-file watchdog is therefore one hour. This bounds an entire fixture file; it changes neither assertions nor individual test/benchmark deadlines. Git configuration is unchanged because the comparison did not establish a configuration defect.
+
+The local T202 lock port writes startedAt after atomic acquisition. Its former pre-wait timestamp counted queue time against ownership and let a challenger reclaim a live suite before its full hold budget. A deterministic isolated-lock regression waits 600 ms, holds for 500 ms under a one-second budget, and requires a challenger to leave that owner intact. The shared record format and stale-owner policy are unchanged; no other checkout's lock implementation is modified.
+
+The ten-host fuzz matrix retains 500 cases per host and creates a fresh hook process for each call. A single host took 382 seconds on Windows; the complete serial matrix has a separate ninety-minute whole-file watchdog in fileTimeoutSecondsByFile. HOOK_TIMEOUT_MS for each call, the M2 sixty-second assertion, every fixed seed and the one-child Windows pool are unchanged. Per-file policy keys use forward slashes for nested paths; an explicit --timeout-ms overrides them.
+
+A long Windows suite can outlast the shared T202 two-hour maximum hold time. Before each file, the runner reserves that file's hard budget, process cleanup and leaseReserveMs. When the reservation would cross maxHoldMs, it releases the lock only after the previous file has exited, yields for one poll interval and reacquires before launching another child. maxFilesPerLease (zero by default) can request an earlier handoff. No tests execute while the lock is released or being reacquired. The shared pid/startedAt/cwd record and stale-owner limits are unchanged; legacy pre-wait timestamps are interpreted with the lock file's acquisition mtime. Isolated regressions check fresh legacy holders, expiration, actual handoff timestamps, ordering and nested per-file budgets.
+
+Zcode invalid-setting cases render their initial configuration and skills from buildRegistry, configEdits, the hook shape and renderSkill through the shared config editor. The former helper ignored runSetup's result, so an unrelated verification failure rolled back config.json and the locale test threw ENOENT before validation. A controlled MCP-server exit reproduces that failure. Schema cases now reach the same doctor assertions without a preparatory runtime probe; the clean-setup integration case still runs full setup and checks its exit code. No production verification deadline changed.
+
+### T225 focused attribution (Windows, checked 2026-11-09)
+
+A detached origin/main worktree at 3a3ef7d53c9a30ef05d8f1b009afbcf8d9c6d0a2 was built once under F:/projects-test/context-mode/t225-main-check, outside F:/Projects, then removed. Each selection ran directly with node --test --test-concurrency=1 --test-reporter=spec, from release-out, without the suite runner or machine lock. No other owned test suite ran concurrently.
+
+| Selection | Clean origin/main | Fork code 0c328376 |
+| --- | --- | --- |
+| Zcode: a clean setup passes doctor; valid user keys and unknown top-level keys keep PASS | 2 tests, 2 pass, 0 fail, exit 0; duration_ms 105046.5331 | 2 tests, 2 pass, 0 fail, exit 0; duration_ms 50300.3782 |
+| Claude hook fuzz, CM_FUZZ_N=500, name pattern hook-fuzz claude-code | 2 tests, 1 pass, 1 fail, exit 1; duration_ms 303422.7381; 51 of 500 calls broke invariants | Earlier branch diagnostic: 2 tests, 1 pass, 1 fail, exit 1; 47 of 500 calls broke invariants |
+
+The Claude deadline/invariant failure reproduces on clean upstream main. It remains a pre-existing performance issue for separate follow-up; T225 does not change its assertions, case count, seeds, or production deadline. The baseline retained main's six-child pool; the fork retains its one-child Windows pool, so counts and durations are attribution evidence, not a performance comparison. A 900-second outer watchdog was armed; baseline finished naturally in 303 seconds.
+
+Get-Process node snapshots were saved before both baseline selections and during the fuzz run. Six nodes preceded baseline Zcode, seven preceded baseline Claude, and seven preceded the fork Zcode rerun; each before-run two-second sample showed zero CPU growth for those processes. The during-Claude sample contained fifteen nodes, including the baseline runner and its own pool. No competing owned suite was present. These samples describe Node activity; they do not prove absence of disk or scheduler contention.
+
+The earlier Zcode diagnostic failed with hook exited null, emitted by src/setup/engine.ts after its unchanged bounded spawnSync probe. Both baseline and the current fork pass the two cases in exclusive runs. Therefore this evidence does not classify the Zcode failures as pre-existing, and no Zcode runtime fix is claimed. The prior branch-only timing failure is not reproduced on current code; future recurrence needs the child error/signal and concurrent-process record, rather than a raised deadline or another blind retry. The engine verification path and the generated fake hook are unchanged from origin/main.

@@ -1,6 +1,6 @@
 // ADR-0013 (release automation), ADR-0019 (npm channel), PRD-v2 section 14: release plan, smoke, rollback, npm tarball check.
 // One file per ADR area (docs/architecture/TEST-LAYOUT.md, ADR-0024); a fix adds its red test here.
-import { describe, test } from "node:test";
+import { beforeEach, describe, test } from "node:test";
 import { CONC } from "./_lib/concurrency.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -9,6 +9,9 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+// Synchronous Git fixtures must yield between cases to flush spec progress.
+beforeEach(() => new Promise((resolve) => setImmediate(resolve)));
 
 // Sections are independent: each builds its own temp git repos and stubs; none changes process.env or the cwd, so they run concurrently.
 describe("ADR-0013 / ADR-0019 / PRD-v2 section 14 release plan", { concurrency: CONC }, () => {

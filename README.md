@@ -565,6 +565,8 @@ Commands in the agent: `/ctx-stats` shows the `ctx_stats` result, `/ctx-doctor` 
 
 ## Security and privacy
 
+The plugin accepts local Streamable HTTP requests in `src/entries/server-http.ts` and posts native hooks to the configured workstation endpoint in `src/entries/hook-http.ts`. Tenant/project-scoped SQLite storage and build details are in [the workstation HTTP guide](docs/architecture/TENANT-HTTP.md).
+
 - The plugin keeps all its data on your machine, one database per project in `~/.context-mode`, and `ctx_purge` deletes it by session, source or project. Read the [Security guide](https://contextmode.ai/docs/engine/security?utm_source=github&utm_medium=readme&utm_content=security).
 - The plugin has zero telemetry: usage data, events and crash reports stay on your machine. It uses the network for four calls, each one started by you or your agent:
 

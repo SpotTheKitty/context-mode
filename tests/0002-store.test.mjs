@@ -1231,3 +1231,293 @@ describe("ADR-0002: lifecycle exit guard (GP9 tty-gate)", () => {
     process.stdin.removeListener("end", added);
   });
 });
+
+// T200: tenant persistence and transport belong to the ADR-0002 store area.
+{
+const {test} = await import('node:test');
+const {default:assert} = await import('node:assert/strict');
+const {mkdtempSync,rmSync} = await import('node:fs');
+const {tmpdir} = await import('node:os');
+const {join} = await import('node:path');
+const {DatabaseSync} = await import('node:sqlite');
+const {httpScope} = await import('../src/core/store/http-scope.ts');
+const {openDb,closeDb,metaSet,metaGet} = await import('../src/core/store/db.ts');
+const {migrateTenantStore} = await import('../src/core/store/tenant-store.ts');
+const {ftsInsert,ftsQuery,deleteChunkRows} = await import('../src/core/store/fts.ts');
+const {listenHttp} = await import('../src/entries/server-http.ts');
+const {build} = await import('esbuild');
+const {spawn,spawnSync} = await import('node:child_process');
+const {writeFileSync} = await import('node:fs');
+const {fileURLToPath} = await import('node:url');
+const {importDatabase,runImport}=await import('../src/entries/import.ts');
+const {readFileSync,existsSync,mkdirSync}=await import('node:fs');
+const {createHash}=await import('node:crypto');
+
+test('import preflight derives private content workspaces and requires shared-root ownership data',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'cm-import-plan-'));const root=join(dir,'old');const shared=join(dir,'mixed');const workspace=join(dir,'workspace');for(const p of [root,shared,workspace])mkdirSync(p);
+ const table=join(dir,'table.json');const config={dataDir:join(dir,'new'),tenants:{alpha:{},beta:{}},imports:[{tenant:'alpha',root},{root:shared}]};
+ const session=new DatabaseSync(join(root,'session.db'));session.exec('CREATE TABLE session_meta(session_id TEXT,project_dir TEXT);CREATE TABLE session_events(id INTEGER PRIMARY KEY,session_id TEXT,data TEXT,project_dir TEXT);');session.prepare('INSERT INTO session_meta VALUES(?,?)').run('session',workspace);session.close();
+ const spelling=workspace.replaceAll('\\','/').toLowerCase();const hash=createHash('sha256').update(spelling).digest('hex').slice(0,16);
+ for(const file of [join(root,hash+'.db'),join(shared,'unknown.db')]){const db=new DatabaseSync(file);db.exec("CREATE TABLE sources(id INTEGER PRIMARY KEY,label TEXT,chunk_count INTEGER);CREATE VIRTUAL TABLE chunks USING fts5(content,source_id UNINDEXED,title);INSERT INTO sources VALUES(1,'old',1);INSERT INTO chunks VALUES('private content',1,'old');");db.close();}
+ try{
+  writeFileSync(table,JSON.stringify({contextMode:config}));assert.throws(()=>runImport(table,true),/explicit tenant\/workspace ownership/);assert.equal(existsSync(config.dataDir),false);
+  const {realpathSync}=process.getBuiltinModule('node:fs');config.importDatabaseMappings={[realpathSync.native(join(shared,'unknown.db')).replaceAll('\\','/')]:{tenant:'beta',workspace}};writeFileSync(table,JSON.stringify({contextMode:config}));
+  assert.equal(runImport(table).length,3);assert.equal(existsSync(config.dataDir),false);assert.equal(runImport(table,true).filter(x=>x.applied).length,3);
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('one-time legacy and current imports preserve sources and isolate HTTP search',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'cm-import-'));const store=join(dir,'shared');const project=join(dir,'workspace');mkdirSync(project);
+ const config={dataDir:store,tenants:{alpha:{agent:'codex'},beta:{agent:'codex'}},imports:[]};let host;
+ try{
+  const old=join(dir,'legacy.db');const db=new DatabaseSync(old);
+  db.exec('CREATE TABLE session_events(id INTEGER PRIMARY KEY,session_id TEXT,type TEXT,data TEXT,project_dir TEXT,created_at INTEGER);CREATE TABLE session_meta(session_id TEXT PRIMARY KEY,project_dir TEXT);CREATE TABLE session_resume(session_id TEXT,snapshot TEXT);');
+  db.prepare('INSERT INTO session_events VALUES(1,?,?,?,?,?)').run('same','tool','alpha importmarker',project,Date.now());db.prepare('INSERT INTO session_meta VALUES(?,?)').run('same',project);db.prepare('INSERT INTO session_resume VALUES(?,?)').run('same','original snapshot');db.close();
+  const before=readFileSync(old);const spec={tenant:'alpha',root:dir};
+  assert.equal(importDatabase(old,spec,config).rows,3);assert.equal(existsSync(store),false);
+  assert.equal(importDatabase(old,spec,config,true).applied,true);assert.equal(importDatabase(old,spec,config,true).alreadyImported,true);assert.deepEqual(readFileSync(old),before);
+  const modern=join(dir,'current.db');const p={projectKey:'old',projectDir:dir,dbPath:modern,worktree:project,containmentRoot:project,agent:'codex',source:'spawn-cwd'};
+  const current=await openDb(p);ftsInsert(current,{sessionId:'same',worktree:project,agent:'codex',kind:'content',label:'beta',bytes:20,createdAt:Date.now()},[{ord:0,text:'beta importmarker',bytes:20}]);metaSet(current,'original-meta','retained');closeDb(current);
+  const beforeCurrent=readFileSync(modern);importDatabase(modern,{tenant:'beta',root:dir},config,true);assert.deepEqual(readFileSync(modern),beforeCurrent);
+  const raw=new DatabaseSync(join(store,'context.db'));try{assert.equal(raw.prepare('SELECT COUNT(*) AS n FROM legacy_records WHERE tenant=? AND table_name=?').get('alpha','session_resume').n,1);assert.equal(raw.prepare('SELECT COUNT(*) AS n FROM sources').get().n,2);}finally{raw.close();}
+  host=await listenHttp({...config,host:'127.0.0.1',port:0,path:'/mcp',tenantHeader:'x-context-tenant',maxRequestBytes:1000000});
+  for(const tenant of ['alpha','beta']){
+   const res=await fetch(`http://127.0.0.1:${host.address().port}/mcp`,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json,text/event-stream','MCP-Protocol-Version':'2025-03-26','x-context-tenant':tenant},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'ctx_search',arguments:{queries:['importmarker'],_workspace:project,_sessionId:'same'}}})});
+   const result=JSON.stringify(await res.json());assert.equal(res.status,200);assert.match(result,new RegExp(tenant));assert.doesNotMatch(result,new RegExp(tenant==='alpha'?'beta':'alpha'));
+  }
+  const changed=new DatabaseSync(old);changed.prepare('UPDATE session_events SET data=?').run('changed');changed.close();assert.throws(()=>importDatabase(old,spec,config,true),/refuses synchronization/);
+ }finally{if(host)await new Promise(r=>host.close(r));rmSync(dir,{recursive:true,force:true});}
+});
+
+test('import rolls back orphan content and resolves unavailable workspaces',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'cm-import-failure-'));const path=join(dir,'legacy.db');const db=new DatabaseSync(path);db.exec("CREATE TABLE sources(id INTEGER PRIMARY KEY,label TEXT);CREATE VIRTUAL TABLE chunks USING fts5(content,source_id UNINDEXED,title);INSERT INTO sources VALUES(1,'old');INSERT INTO chunks VALUES('orphan',2,'title');");db.close();
+ const config={dataDir:join(dir,'shared'),tenants:{alpha:{}},imports:[]};
+ try{
+  assert.equal(importDatabase(path,{tenant:'alpha',root:dir,workspace:join(dir,'deleted')},config).rows,2);assert.equal(existsSync(config.dataDir),false);
+  assert.throws(()=>importDatabase(path,{tenant:'alpha',root:dir,workspace:dir},config,true),/Orphan chunk/);
+  const raw=new DatabaseSync(join(config.dataDir,'context.db'));try{for(const table of ['sources','chunks','legacy_records','meta'])assert.equal(raw.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n,0);}finally{raw.close();}
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('tenant and project scope applies to FTS, vocabulary, metadata, mutations and legacy tagging',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'cm-tenants-'));const database=join(dir,'context.db');
+ const project={projectKey:'one',projectDir:dir,dbPath:database,worktree:dir,containmentRoot:dir,agent:'codex',source:'spawn-cwd'};
+ const scoped=(tenant,fn,p=project)=>httpScope.run({tenant,database},async()=>{const db=await openDb(p);try{return await fn(db)}finally{closeDb(db)}});
+ try {
+  for(const tenant of ['alpha','beta']) await scoped(tenant,db=>{metaSet(db,'same-key',tenant);ftsInsert(db,{sessionId:'same',worktree:dir,agent:'codex',kind:'content',label:'same',bytes:32,createdAt:Date.now()},[{ord:0,text:tenant+' unique '+tenant+'token',bytes:32}]);});
+  for(const tenant of ['alpha','beta']) await scoped(tenant,db=>{
+   assert.equal(metaGet(db,'same-key'),tenant);
+   assert.equal(db.raw.prepare("SELECT COUNT(*) AS n FROM chunks WHERE chunks MATCH 'unique'").get().n,1);
+   assert.deepEqual(db.raw.prepare('SELECT DISTINCT tenant FROM sources').all().map(r=>r.tenant),[tenant]);
+   assert.equal(db.raw.prepare('SELECT term FROM chunks_vocab WHERE term=?').get(tenant==='alpha'?'betatoken':'alphatoken'),undefined);
+  });
+  await scoped('alpha',db=>{deleteChunkRows(db.raw,'all');db.raw.exec('DELETE FROM sources');metaSet(db,'same-key','changed');});
+  await scoped('beta',db=>{assert.equal(db.raw.prepare('SELECT count(*) AS n FROM chunks').get().n,1);assert.equal(metaGet(db,'same-key'),'beta');});
+  await scoped('beta',db=>assert.equal(db.raw.prepare('SELECT count(*) AS n FROM sources').get().n,0),{...project,projectKey:'two'});
+  const legacyProject={...project,dbPath:join(dir,'legacy.db')};
+  const old=await openDb(legacyProject);metaSet(old,'old-key','old-value');ftsInsert(old,{sessionId:'old',worktree:dir,agent:'codex',kind:'content',label:'legacy',bytes:12,createdAt:Date.now()},[{ord:0,text:'legacy text',bytes:12}]);closeDb(old);
+  const legacy=new DatabaseSync(legacyProject.dbPath);migrateTenantStore(legacy,'imported','legacy-project');
+  for(const table of ['sources','events','meta','chunks','line_units']) assert.ok(legacy.prepare(`PRAGMA table_info(${table})`).all().some(r=>r.name==='tenant'));
+  assert.equal(legacy.prepare('SELECT tenant FROM sources').get().tenant,'imported');assert.equal(legacy.prepare('SELECT tenant FROM chunks').get().tenant,'imported');assert.equal(legacy.prepare('SELECT value FROM meta').get().value,'old-value');legacy.close();
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('bundled server runs from a flat directory without a repository or node_modules',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'cm-flat-'));let child;
+ try{
+  for(const name of ['server-http','import']) await build({absWorkingDir:fileURLToPath(new URL('..',import.meta.url)),entryPoints:[`src/entries/${name}.ts`],outfile:join(dir,`${name}.mjs`),bundle:true,platform:'node',format:'esm',target:'node24',external:['node:*'],banner:{js:'import {createRequire as __cmCreateRequire} from "node:module"; const require=__cmCreateRequire(import.meta.url);'}});
+  const table=join(dir,'endpoints.json');writeFileSync(table,JSON.stringify({contextMode:{host:'127.0.0.1',port:0,path:'/mcp',tenantHeader:'x-context-tenant',dataDir:join(dir,'data'),maxRequestBytes:1000000,tenants:{alpha:{agent:'codex'}},imports:[]}}));
+  const plan=spawnSync(process.execPath,[join(dir,'import.mjs'),table],{cwd:dir,encoding:'utf8',windowsHide:true});assert.equal(plan.status,0,plan.stderr);assert.deepEqual(JSON.parse(plan.stdout),[]);assert.equal(existsSync(join(dir,'data')),false);
+  child=spawn(process.execPath,[join(dir,'server-http.mjs'),table],{cwd:dir,stdio:['ignore','ignore','pipe'],windowsHide:true});
+  const ready=await new Promise((resolve,reject)=>{let text='';const timer=setTimeout(()=>reject(new Error('flat entry did not listen within 30 seconds: '+text)),30000);child.on('exit',code=>{clearTimeout(timer);reject(new Error('entry exited '+code+': '+text))});child.stderr.on('data',data=>{text+=data;for(const line of text.split('\n')){try{const row=JSON.parse(line);if(row.event==='listening'){clearTimeout(timer);resolve(row);return;}}catch{}}});});
+  assert.equal(ready.pid,child.pid);assert.equal(ready.parentPid,process.pid);
+  const res=await fetch(`http://127.0.0.1:${ready.address.port}/healthz`);assert.equal(res.status,200);
+  console.log('flat HTTP server process: node '+ready.pid+'; parent '+ready.parentPid+'; one server for all tenants');
+ }finally{if(child){child.kill();await new Promise(r=>child.once('exit',r));}rmSync(dir,{recursive:true,force:true});}
+});
+
+test('HTTP ctx_index and ctx_search isolate two concurrent tenants in one SQLite file',async()=>{
+ const dataDir=mkdtempSync(join(tmpdir(),'cm-http-'));const host=await listenHttp({host:'127.0.0.1',port:0,path:'/mcp',tenantHeader:'x-context-tenant',dataDir,maxRequestBytes:1000000,tenants:{alpha:{agent:'codex'},beta:{agent:'codex'}}});
+ const endpoint=`http://127.0.0.1:${host.address().port}/mcp`;
+ async function call(tenant,name,args){const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json, text/event-stream','MCP-Protocol-Version':'2025-03-26','x-context-tenant':tenant},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name,arguments:{...args,_workspace:dataDir,_sessionId:'shared-session'}}})});const body=await res.json();assert.equal(res.status,200,JSON.stringify(body));assert.ok(!body.error,JSON.stringify(body));assert.ok(!body.result.isError,JSON.stringify(body));return JSON.stringify(body.result);}
+ try {
+  assert.equal((await fetch(endpoint,{method:'POST'})).status,403);
+  await Promise.all(['alpha','beta'].map(tenant=>call(tenant,'ctx_index',{content:`${tenant} secretmarker`,source:tenant})));
+  await Promise.all(['alpha','beta'].map(async tenant=>{const result=await call(tenant,'ctx_search',{queries:['secretmarker']});assert.match(result,new RegExp(tenant));assert.doesNotMatch(result,new RegExp(tenant==='alpha'?'beta':'alpha'));}));
+  const raw=new DatabaseSync(join(dataDir,'context.db'));try{assert.equal(raw.prepare('SELECT count(DISTINCT tenant) AS n FROM sources').get().n,2);}finally{raw.close();}
+ }finally{await new Promise(r=>host.close(r));rmSync(dataDir,{recursive:true,force:true});}
+});
+// T230: ctx_search is bounded. A slow search must not stop /healthz or other tenants, and one past its budget answers with a timeout result.
+{
+ const base=(dataDir,extra={})=>({host:'127.0.0.1',port:0,path:'/mcp',tenantHeader:'x-context-tenant',dataDir,maxRequestBytes:1000000,tenants:{alpha:{agent:'codex'},beta:{agent:'codex'}},...extra});
+ const rpc=async(port,tenant,name,args,workspace)=>{const res=await fetch(`http://127.0.0.1:${port}/mcp`,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json, text/event-stream','MCP-Protocol-Version':'2025-03-26','x-context-tenant':tenant},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name,arguments:{...args,_workspace:workspace,_sessionId:'t230'}}})});return {status:res.status,body:await res.json()};};
+ const slowOnly=(ms)=>(args)=>JSON.stringify(args).includes('slowmarker')?ms:0;
+ // Longest gap between two ticks of a 20 ms timer in this process: it grows when something holds the event loop.
+ const watchLoop=()=>{let last=performance.now(),worst=0;const timer=setInterval(()=>{const now=performance.now();worst=Math.max(worst,now-last-20);last=now;},20);return ()=>{clearInterval(timer);return worst;};};
+ const stalled=async(config,stall)=>{
+  const dataDir=mkdtempSync(join(tmpdir(),'cm-bound-'));const host=await listenHttp(base(dataDir,config),{searchStall:slowOnly(stall)});const port=host.address().port;
+  return {dataDir,host,port,close:async()=>{host.closeAllConnections();await new Promise(r=>host.close(r));rmSync(dataDir,{recursive:true,force:true});}};
+ };
+ test('T230: /healthz and another tenant answer while a slow search runs',async()=>{
+  const s=await stalled({},2500);const stop=watchLoop();
+  try{
+   await rpc(s.port,'alpha','ctx_index',{content:'alpha slowmarker text',source:'a'},s.dataDir);
+   let done=false;const search=rpc(s.port,'alpha','ctx_search',{queries:['slowmarker']},s.dataDir).then(r=>{done=true;return r;});
+   await new Promise(r=>setTimeout(r,300));
+   const health=[];
+   for(let i=0;i<5;i++){const t=performance.now();const res=await fetch(`http://127.0.0.1:${s.port}/healthz`);assert.equal(await res.text(),'ok');health.push(performance.now()-t);await new Promise(r=>setTimeout(r,100));}
+   const other=performance.now();const indexed=await rpc(s.port,'beta','ctx_index',{content:'beta plain text',source:'b'},s.dataDir);const otherMs=performance.now()-other;
+   assert.equal(done,false,'the slow search is still running');
+   assert.ok(Math.max(...health)<500,'healthz answered in '+Math.max(...health)+' ms');
+   assert.equal(indexed.status,200);assert.ok(!indexed.body.result.isError);assert.ok(otherMs<1000,'other tenant took '+otherMs+' ms');
+   const result=await search;assert.equal(result.status,200);assert.ok(!result.body.result.isError,JSON.stringify(result.body));
+   assert.ok(stop()<1000,'event loop was held');
+  }finally{stop();await s.close();}
+ });
+ test('T230 control: with no search workers the same search holds the event loop',async()=>{
+  const s=await stalled({searchWorkers:0},1500);const stop=watchLoop();
+  try{
+   await rpc(s.port,'alpha','ctx_index',{content:'alpha slowmarker text',source:'a'},s.dataDir);
+   const result=await rpc(s.port,'alpha','ctx_search',{queries:['slowmarker']},s.dataDir);assert.equal(result.status,200);
+   assert.ok(stop()>1000,'the unbounded path should have blocked the loop');
+  }finally{stop();await s.close();}
+ });
+ test('T230: a search over budget returns a timeout result and the server keeps working',async()=>{
+  // A worker thread loads the whole entry on first use, which counts toward the budget: warm both workers, then time out a slow search.
+  const s=await stalled({searchTimeoutMs:2000},8000);
+  try{
+   await rpc(s.port,'alpha','ctx_index',{content:'alpha slowmarker text fastmarker',source:'a'},s.dataDir);
+   await Promise.all([1,2].map(()=>rpc(s.port,'alpha','ctx_search',{queries:['fastmarker']},s.dataDir)));
+   const t=performance.now();const slow=await rpc(s.port,'alpha','ctx_search',{queries:['slowmarker']},s.dataDir);const ms=performance.now()-t;
+   assert.equal(slow.status,200);assert.equal(slow.body.result.isError,true);
+   const text=slow.body.result.content[0].text;assert.match(text,/ctx_search timed out/);assert.match(text,/2000 ms/);assert.match(text,/did not finish/);
+   assert.ok(ms<4000,'timeout reply took '+ms+' ms');
+   const fast=await rpc(s.port,'alpha','ctx_search',{queries:['fastmarker']},s.dataDir);assert.ok(!fast.body.result.isError,JSON.stringify(fast.body));assert.match(JSON.stringify(fast.body.result),/fastmarker/);
+   assert.equal((await fetch(`http://127.0.0.1:${s.port}/healthz`)).status,200);
+  }finally{await s.close();}
+ });
+ test('T230: a worker stuck inside SQLite still counts, and queue wait counts toward the budget',async()=>{
+  // node:sqlite cannot be interrupted, so terminate() waits for the statement: the stub worker runs a ~3 s native statement.
+  const {SearchPool}=await import('../src/entries/search-pool.ts');
+  const dir=mkdtempSync(join(tmpdir(),'cm-pool-'));const stub=join(dir,'stub.mjs');
+  writeFileSync(stub,"import {parentPort} from 'node:worker_threads';import {DatabaseSync} from 'node:sqlite';parentPort.on('message',m=>{new DatabaseSync(':memory:').prepare('WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<30000000) SELECT count(*) AS n FROM c').get();parentPort.postMessage({id:m.id,error:'finished'});});");
+  const pool=new SearchPool(stub,1);
+  try{
+   const first=pool.run({},500);
+   await new Promise(r=>setTimeout(r,100));
+   const t=performance.now();const queued=await pool.run({},500);const waited=performance.now()-t;
+   assert.deepEqual(await first,{kind:'timeout',started:true});
+   assert.deepEqual(queued,{kind:'timeout',started:false});
+   assert.ok(waited>=350&&waited<1500,'queued search answered after '+waited+' ms');
+  }finally{await pool.close();rmSync(dir,{recursive:true,force:true});}
+ });
+ test('T230: the bundled server runs bounded searches from a flat directory',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'cm-flat-search-'));let child;
+  try{
+   await build({absWorkingDir:fileURLToPath(new URL('..',import.meta.url)),entryPoints:['src/entries/server-http.ts'],outfile:join(dir,'server-http.mjs'),bundle:true,platform:'node',format:'esm',target:'node24',external:['node:*'],banner:{js:'import {createRequire as __cmCreateRequire} from "node:module"; const require=__cmCreateRequire(import.meta.url);'}});
+   const table=join(dir,'endpoints.json');writeFileSync(table,JSON.stringify({contextMode:base(join(dir,'data'),{port:0,tenants:{alpha:{agent:'codex'}}})}));
+   child=spawn(process.execPath,[join(dir,'server-http.mjs'),table],{cwd:dir,stdio:['ignore','ignore','pipe'],windowsHide:true});
+   const ready=await new Promise((resolve,reject)=>{let text='';const timer=setTimeout(()=>reject(new Error('flat entry did not listen: '+text)),30000);child.on('exit',code=>{clearTimeout(timer);reject(new Error('entry exited '+code+': '+text))});child.stderr.on('data',data=>{text+=data;for(const line of text.split('\n')){try{const row=JSON.parse(line);if(row.event==='listening'){clearTimeout(timer);resolve(row);return;}}catch{}}});});
+   const port=ready.address.port;
+   assert.ok(!(await rpc(port,'alpha','ctx_index',{content:'flat bundle searchable text',source:'flat'},dir)).body.result.isError);
+   const found=await rpc(port,'alpha','ctx_search',{queries:['searchable']},dir);assert.ok(!found.body.result.isError,JSON.stringify(found.body));assert.match(JSON.stringify(found.body.result),/searchable/);
+  }finally{if(child){child.kill();await new Promise(r=>child.once('exit',r));}rmSync(dir,{recursive:true,force:true});}
+ });
+ test('T230: typo correction offers only terms the tenant indexed',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'cm-typo-'));const database=join(dir,'context.db');
+  const project={projectKey:'one',projectDir:dir,dbPath:database,worktree:dir,containmentRoot:dir,agent:'codex',source:'spawn-cwd'};
+  const scoped=(tenant,fn)=>httpScope.run({tenant,database},async()=>{const db=await openDb(project);try{return await fn(db)}finally{closeDb(db)}});
+  try{
+   for(const [tenant,word] of [['alpha','quartzine'],['beta','quartzite']]) await scoped(tenant,db=>ftsInsert(db,{sessionId:'s',worktree:dir,agent:'codex',kind:'content',label:tenant,bytes:20,createdAt:Date.now()},[{ord:0,text:word+' sample text',bytes:20}]));
+   const hits=(tenant)=>scoped(tenant,db=>ftsQuery(db,'quartzise','project',project,'s',10,0).map(h=>h.label));
+   assert.deepEqual(await hits('alpha'),['alpha']);assert.deepEqual(await hits('beta'),['beta']);
+  }finally{rmSync(dir,{recursive:true,force:true});}
+ });
+ test('T230: the trigram statement reads rows in proportion to the tenant, not the whole store',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'cm-vm-'));const database=join(dir,'context.db');
+  const project={projectKey:'one',projectDir:dir,dbPath:database,worktree:dir,containmentRoot:dir,agent:'codex',source:'spawn-cwd'};
+  const scoped=(tenant,fn)=>httpScope.run({tenant,database},async()=>{const db=await openDb(project);try{return await fn(db)}finally{closeDb(db)}});
+  try{
+   for(const tenant of ['alpha','beta']) await scoped(tenant,db=>{for(let i=0;i<400;i++) ftsInsert(db,{sessionId:'s',worktree:dir,agent:'codex',kind:'content',label:tenant+i,bytes:40,createdAt:Date.now()},[{ord:0,text:(tenant==='alpha'&&i<5?'searchterm ':'')+tenant+' filler number '+i,bytes:40}]);});
+   await scoped('alpha',db=>{
+    const st=db.raw.prepare('SELECT t.rowid AS rid FROM chunks_tri t JOIN chunks c ON c.rowid = t.rowid WHERE chunks_tri MATCH :m');
+    const rows=st.all({m:'"searchterm"'});assert.equal(rows.length,5);
+    // One scan of both tenants' 800 chunks per statement was the shape that took 8 to 68 s on the 333 MB store.
+    assert.ok(st.stat('vmStep')<1500,'vmStep '+st.stat('vmStep'));
+   });
+  }finally{rmSync(dir,{recursive:true,force:true});}
+ });
+}
+const {forwardHook}=await import('../src/entries/hook-http.ts');
+test('HTTP native hooks index into the tenant store and fail open on transport failure',async()=>{
+ const dataDir=mkdtempSync(join(tmpdir(),'cm-http-hooks-'));
+ const config={host:'127.0.0.1',port:0,path:'/mcp',tenantHeader:'x-context-tenant',dataDir,maxRequestBytes:1000000,hookTimeoutMs:5000,tenants:{alpha:{agent:'claude-code',toolPrefix:'mcp__contextMode__'},beta:{agent:'claude-code',toolPrefix:'mcp__contextMode__'}}};
+ const host=await listenHttp(config);config.port=host.address().port;let closed=false;
+ try{
+  for(const tenant of ['alpha','beta']){
+   const out=await forwardHook(config,tenant,{session_id:'hook-shared',cwd:dataDir,hook_event_name:'PostToolUse',tool_name:'Bash',tool_input:{command:'echo '+tenant},tool_response:{stdout:(tenant+' hookmarker ').repeat(6000),exit_code:0}});
+   assert.equal(out.exitCode,0);
+  }
+  const db=new DatabaseSync(join(dataDir,'context.db'));try{assert.deepEqual(db.prepare('SELECT DISTINCT tenant FROM events ORDER BY tenant').all().map(r=>r.tenant),['alpha','beta']);assert.equal(db.prepare('SELECT COUNT(DISTINCT tenant) AS n FROM sources').get().n,2);}finally{db.close();}
+  await new Promise(r=>host.close(r));closed=true;
+  const fallback=await forwardHook(config,'alpha',{session_id:'hook-shared',cwd:dataDir,hook_event_name:'PreToolUse',tool_name:'Bash',tool_input:{command:'curl https://example.com'}});
+  assert.equal(fallback.exitCode,0);assert.equal(fallback.stdout,'');assert.match(fallback.stderr,/allowed/);
+ }finally{if(!closed)await new Promise(r=>host.close(r));rmSync(dataDir,{recursive:true,force:true});}
+});
+
+}
+
+// ADR-0002: HTTP fail-open and legacy ownership fallback (T212).
+{
+const {default:test}=await import('node:test');
+const {default:assert}=await import('node:assert/strict');
+const {mkdtempSync,readFileSync,rmSync}=await import('node:fs');
+const {tmpdir}=await import('node:os');
+const {join}=await import('node:path');
+const {createServer}=await import('node:http');
+const {DatabaseSync}=await import('node:sqlite');
+const {forwardHook}=await import('../src/entries/hook-http.ts');
+const {importDatabase,legacyWorkspace,legacyProjectKey}=await import('../src/entries/import.ts');
+const {resolveProject}=await import('../src/core/project/resolve.ts');
+test('HTTP timeout allows shell and logs exactly one line',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'http-timeout-'));const host=createServer(()=>{});
+ await new Promise(r=>host.listen(0,'127.0.0.1',r));
+ try{
+  const out=await forwardHook({dataDir:dir,host:'127.0.0.1',port:host.address().port,path:'/mcp',tenantHeader:'x-context-tenant',hookTimeoutMs:25,tenants:{alpha:{agent:'claude-code'}}},'alpha',{hook_event_name:'PreToolUse',tool_name:'Bash',tool_input:{command:'pwsh'}});
+  assert.equal(out.stdout,'');assert.equal(out.exitCode,0);assert.match(out.stderr,/allowed/);
+  assert.equal(readFileSync(join(dir,'hook-errors.log'),'utf8').trim().split('\n').length,1);
+ }finally{host.closeAllConnections();await new Promise(r=>host.close(r));rmSync(dir,{recursive:true,force:true});}
+});
+for(const scenario of ['vanished workspace resolves by rule','session without workspace uses tenant legacy key','explicit mapping wins','session resume supplies workspace']){
+ test(scenario,()=>{
+  const dir=mkdtempSync(join(tmpdir(),'import-fallback-'));
+  try{
+   const dbPath=join(dir,'session.db');const db=new DatabaseSync(dbPath);
+   db.exec('CREATE TABLE session_events(id INTEGER,session_id TEXT,data TEXT,project_dir TEXT); CREATE TABLE session_resume(session_id TEXT,worktree TEXT)');
+   const workspace=scenario.startsWith('session')?'':join(dir,'vanished','child');
+   db.prepare('INSERT INTO session_events VALUES(1,?,?,?)').run('s','hello',workspace);
+   if(scenario.includes('resume')) db.prepare('INSERT INTO session_resume VALUES(?,?)').run('s',dir);
+   db.close();
+   const config={dataDir:join(dir,'out'),tenants:{alpha:{}},imports:[],importProjectMappings:scenario.startsWith('explicit')?{[workspace]:tmpdir()}:{}};
+   const result=importDatabase(dbPath,{tenant:'alpha',root:dir},config,true);
+   const expected=scenario.includes('without')?legacyProjectKey('alpha'):resolveProject('codex',{env:{},argv:[],cwd:scenario.startsWith('explicit')?tmpdir():dir}).projectKey;
+   assert.deepEqual(result.projects,[expected]);assert.equal(importDatabase(dbPath,{tenant:'alpha',root:dir},config,true).alreadyImported,true);
+   assert.equal(legacyWorkspace(join(dir,'gone')),dir);
+  }finally{rmSync(dir,{recursive:true,force:true});}
+ });
+}
+
+test('UNC and slash-drive spellings fold to the same ancestor',{skip:process.platform!=='win32'},()=>{
+ assert.equal(legacyWorkspace('//host/c$/Users/spott/missing-t212'),legacyWorkspace('C:/Users/spott/missing-t212'));
+ assert.equal(legacyWorkspace('/c/Users/spott/missing-t212'),legacyWorkspace('C:/Users/spott/missing-t212'));
+});
+test('HTTP non-success allows and logs one line',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'http-status-'));const host=createServer((_,res)=>{res.writeHead(503);res.end();});
+ await new Promise(r=>host.listen(0,'127.0.0.1',r));
+ try{
+  const out=await forwardHook({dataDir:dir,host:'127.0.0.1',port:host.address().port,path:'/mcp',tenantHeader:'x-context-tenant',hookTimeoutMs:2000,tenants:{alpha:{agent:'claude-code'}}},'alpha',{hook_event_name:'PostToolUse'});
+  assert.equal(out.stdout,'');assert.equal(out.exitCode,0);
+  assert.equal(readFileSync(join(dir,'hook-errors.log'),'utf8').trim().split('\n').length,1);
+ }finally{host.closeAllConnections();await new Promise(r=>host.close(r));rmSync(dir,{recursive:true,force:true});}
+});
+}

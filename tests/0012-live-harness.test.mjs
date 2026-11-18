@@ -495,3 +495,133 @@ process.stdin.on("end", () => {
     test("live-local repo-cleanup-gate", () => runLocal("repo-cleanup-gate"));
   });
 });
+
+describe("T225 bounded full-suite runner", () => {
+  const runnerSource = fileURLToPath(new URL("../scripts/", import.meta.url));
+  function fixture(t) {
+    const root = fs.realpathSync(mkdtempSync(path.join(tmpdir(), "cm-suite-driver-")));
+    for (const name of ["scripts", "tests", "locks"]) fs.mkdirSync(path.join(root, name));
+    for (const name of ["test-suite.mjs", "test-lock.mjs", "test-suite.json"]) fs.copyFileSync(path.join(runnerSource, name), path.join(root, "scripts", name));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    return { root, tests: path.join(root, "tests"), lock: path.join(root, "locks"), script: path.join(root, "scripts", "test-suite.mjs") };
+  }
+  function run(s, extra = [], policyTimeouts = false) {
+    const env = { ...process.env, TEST_LOCK_DIR: s.lock };
+    delete env.TEST_LOCK_WAIT_SECONDS;
+    return spawnSync(process.execPath, [s.script, "--no-build", ...(policyTimeouts ? [] : ["--timeout-ms", "30000"]), ...extra], { cwd: s.root, env, encoding: "utf8", timeout: 120000 });
+  }
+  test("T225 runner discovers nested files and summarizes from a copied layout with no repository", (t) => {
+    const s = fixture(t);
+    fs.mkdirSync(path.join(s.tests, "nested"));
+    for (const name of ["a.test.mjs", "nested/b.test.mjs"]) writeFileSync(path.join(s.tests, name), 'import {test} from "node:test"; test("fixture passes",()=>{});');
+    const r = run(s);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /FULL SUITE: files=2 tests=2 suites=0 pass=2 fail=0/);
+    assert.equal(fs.existsSync(path.join(s.lock, "crew-runtime-tests.lock")), false, "released the workstation lock");
+  });
+  test("T225 per-file watchdog names the hanging test, frees its port and continues", async (t) => {
+    const s = fixture(t);
+    const portFile = path.join(s.root, "port");
+    writeFileSync(path.join(s.tests, "a-hang.test.mjs"), `import {test} from 'node:test'; import net from 'node:net'; import {writeFileSync} from 'node:fs'; test('owned open-port fixture',async()=>{const server=net.createServer(); await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve)); writeFileSync(${JSON.stringify(portFile)},String(server.address().port));});`);
+    writeFileSync(path.join(s.tests, "b-pass.test.mjs"), 'import {test} from "node:test"; test("following file passed",()=>{});');
+    // Five seconds could expire during nested node:test startup on a busy Windows
+    // machine, before this intentional open-handle fixture reached its test.
+    // Wait for listen in the fixture and allow startup before testing cleanup.
+    const r = run(s);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /a-hang.test.mjs exit=124 TIMEOUT last=.*owned open-port fixture/);
+    assert.match(r.stdout, /following file passed/);
+    assert.match(r.stdout, /fileFailures=1 timeouts=1/);
+    const net = await import("node:net");
+    const server = net.createServer();
+    await new Promise((resolve, reject) => { server.once("error", reject); server.listen(Number(readFileSync(portFile, "utf8")), "127.0.0.1", resolve); });
+    await new Promise((resolve) => server.close(resolve));
+  });
+  test("T225 runner waits for a T202 lock holder and leaves its lock intact", (t) => {
+    const s = fixture(t);
+    writeFileSync(path.join(s.tests, "a.test.mjs"), 'import {test} from "node:test"; test("must not start",()=>{});');
+    const lockFile = path.join(s.lock, "crew-runtime-tests.lock");
+    writeFileSync(lockFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), cwd: s.root }));
+    const configPath = path.join(s.root, "scripts", "test-suite.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    config.lock.maxWaitMs = 100; config.lock.pollMs = 10;
+    writeFileSync(configPath, JSON.stringify(config));
+    const r = run(s);
+    assert.equal(r.status, 75, r.stdout + r.stderr);
+    assert.match(r.stdout + r.stderr, new RegExp(`held by pid ${process.pid}`));
+    assert.equal(JSON.parse(readFileSync(lockFile, "utf8")).pid, process.pid);
+  });
+  test("T225 queued lock hold budget starts at acquisition", async (t) => {
+    const s = fixture(t);
+    const { acquireLock } = await import("../scripts/test-lock.mjs");
+    const rules = JSON.parse(readFileSync(path.join(s.root, "scripts", "test-suite.json"), "utf8")).lock;
+    Object.assign(rules, { maxHoldMs: 1000, maxWaitMs: 1000, pollMs: 1 });
+    const lockFile = path.join(s.lock, rules.fileName);
+    let clock = 100000;
+    writeFileSync(lockFile, JSON.stringify({ pid: 111, startedAt: new Date(clock).toISOString(), cwd: s.root }));
+    fs.utimesSync(lockFile, new Date(clock), new Date(clock));
+    const holder = await acquireLock({ dir: s.lock, rules, pid: 222, cwd: s.root,
+      now: () => clock, isAlive: () => true,
+      sleep: async () => { clock += 600; fs.unlinkSync(lockFile); } });
+    t.after(() => holder.release());
+    assert.equal(JSON.parse(readFileSync(lockFile, "utf8")).startedAt, new Date(clock).toISOString());
+    assert.equal(holder.acquiredAtMs, clock);
+    fs.utimesSync(lockFile, new Date(clock), new Date(clock));
+    clock += 500; // 1.1 s since queuing, but only 0.5 s of the 1 s hold budget.
+    await assert.rejects(acquireLock({ dir: s.lock, rules: { ...rules, maxWaitMs: 0 }, pid: 333,
+      now: () => clock, isAlive: () => true }), { name: "LockWaitTimeout" });
+    assert.equal(JSON.parse(readFileSync(lockFile, "utf8")).pid, 222);
+  });
+  test("T225 a legacy queued record gets its full hold budget, then expires", async (t) => {
+    const s = fixture(t);
+    const { acquireLock } = await import("../scripts/test-lock.mjs");
+    const rules = JSON.parse(readFileSync(path.join(s.root, "scripts", "test-suite.json"), "utf8")).lock;
+    Object.assign(rules, { maxHoldMs: 1000, maxWaitMs: 0, pollMs: 1 });
+    const lockFile = path.join(s.lock, rules.fileName);
+    const acquired = 201100;
+    writeFileSync(lockFile, JSON.stringify({ pid: 111, startedAt: new Date(200000).toISOString(), cwd: s.root }));
+    fs.utimesSync(lockFile, new Date(acquired), new Date(acquired));
+    let clock = acquired + 500;
+    await assert.rejects(acquireLock({ dir: s.lock, rules, pid: 222, now: () => clock, isAlive: () => true }), { name: "LockWaitTimeout" });
+    assert.equal(JSON.parse(readFileSync(lockFile, "utf8")).pid, 111);
+    clock = acquired + 1001;
+    const holder = await acquireLock({ dir: s.lock, rules, pid: 222, now: () => clock, isAlive: () => true });
+    t.after(() => holder.release());
+    assert.equal(JSON.parse(readFileSync(lockFile, "utf8")).pid, 222);
+  });
+  test("T225 lease reserves the next file, cleanup and safety margin", async () => {
+    const { leaseNeedsRotation } = await import("../scripts/test-lock.mjs");
+    const minute = 60000;
+    const common = { completedFiles: 1, cleanupBudgetMs: 15000,
+      rules: { maxHoldMs: 120 * minute, leaseReserveMs: minute, maxFilesPerLease: 0 } };
+    assert.equal(leaseNeedsRotation({ ...common, heldMs: 58 * minute, fileBudgetMs: 60 * minute }), false);
+    assert.equal(leaseNeedsRotation({ ...common, heldMs: 59 * minute, fileBudgetMs: 60 * minute }), true);
+    assert.equal(leaseNeedsRotation({ ...common, heldMs: 58 * minute + 54000, fileBudgetMs: 60 * minute }), true);
+    assert.equal(leaseNeedsRotation({ ...common, heldMs: 28 * minute, fileBudgetMs: 90 * minute }), false);
+    assert.equal(leaseNeedsRotation({ ...common, heldMs: 29 * minute, fileBudgetMs: 90 * minute }), true);
+  });
+  test("T225 runner hands off between completed files and applies nested file budgets", (t) => {
+    const s = fixture(t);
+    const observations = path.join(s.root, "leases.jsonl");
+    const lockFile = path.join(s.lock, "crew-runtime-tests.lock");
+    fs.mkdirSync(path.join(s.tests, "nested"));
+    const program = `import {test} from 'node:test'; import {readFileSync,appendFileSync} from 'node:fs'; test('observe lease',()=>{const held=JSON.parse(readFileSync(${JSON.stringify(lockFile)},'utf8'));appendFileSync(${JSON.stringify(observations)},JSON.stringify(held)+String.fromCharCode(10));});`;
+    for (const relative of ["a.test.mjs", path.join("nested", "b.test.mjs")]) writeFileSync(path.join(s.tests, relative), program);
+    const configPath = path.join(s.root, "scripts", "test-suite.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    config.lock.maxFilesPerLease = 1; config.lock.pollMs = 20;
+    config.fileTimeoutSecondsByFile = { "nested/b.test.mjs": 42 };
+    writeFileSync(configPath, JSON.stringify(config));
+    const r = run(s, [], true);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const output = r.stdout.split(path.sep).join("/");
+    assert.ok(output.includes("FILE START nested/b.test.mjs budgetMs=42000"), output);
+    assert.ok(output.indexOf("FILE END a.test.mjs exit=0") < output.indexOf("FULL SUITE LOCK YIELD"), output);
+    assert.ok(output.includes("leaseRotations=1"), output);
+    const records = readFileSync(observations, "utf8").trim().split(String.fromCharCode(10)).map((line) => JSON.parse(line));
+    assert.equal(records.length, 2);
+    assert.equal(records[0].pid, records[1].pid);
+    assert.notEqual(records[0].startedAt, records[1].startedAt);
+    assert.equal(fs.existsSync(lockFile), false);
+  });
+});

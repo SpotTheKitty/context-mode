@@ -4,6 +4,7 @@
 // vscode-gate and gemini-gate are serial because their tests call process.chdir; kiro-gate runs concurrently.
 
 import { describe, test } from "node:test";
+import { kiroLoadedEvent } from "./_lib/host-probe-fixtures.mjs";
 import { CONC } from "./_lib/concurrency.mjs";
 import assert from "node:assert/strict";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -433,6 +434,16 @@ rl.on("line", (l) => {
       const after = JSON.parse(readFileSync(s.file, "utf8")).hooks;
       assert.equal(after.find((e) => e.name === "context-mode-SessionStart").enabled, true);
       assert.deepEqual(after.find((e) => e.name === "my-lint"), mine);
+    });
+    test("T225 Kiro loader log fixture preserves read and registered counts", () => {
+      const fixture = JSON.stringify({ level: "INFO", message: 'hooks.reload.loaded {"read":6,"registered":6}' });
+      assert.deepEqual(kiroLoadedEvent(fixture), { read: 6, registered: 6 });
+      assert.deepEqual(kiroLoadedEvent('unrelated log\n' + fixture), { read: 6, registered: 6 });
+    });
+    test("T225 Kiro loader fixture does not acknowledge absent or malformed events", () => {
+      for (const text of ['', '{}', 'not JSON', JSON.stringify({ message: 'hooks.reload.loaded {"read":6,"registered":"six"}' })]) {
+        assert.equal(kiroLoadedEvent(text), undefined);
+      }
     });
   });
 });
