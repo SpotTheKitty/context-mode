@@ -5,8 +5,9 @@
 // Agent-specific output rules (Kiro prompt stdout) live in the adapter's encode (A28), not here.
 import type { HookOutput } from "../core/contracts/types.ts";
 import { AGENT_IDS, type AgentId } from "../core/contracts/agents.ts";
-import { AGENT_ARG } from "../core/contracts/constants.ts";
+import { AGENT_ARG, HOOK_DB_BUDGET_MS } from "../core/contracts/constants.ts";
 import { failureOutput, handleHook, logHookError, readStdin, writeOut } from "../core/hooks/dispatch.ts";
+import { limitBusyWait } from "../core/store/db.ts";
 
 const EMPTY: HookOutput = { stdout: "", exitCode: 0 };
 
@@ -34,6 +35,9 @@ function failed(agent: AgentId, raw: unknown, stage: string, err: unknown, env: 
 }
 
 export async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<void> {
+  // D-HOOK-BUSY-1: the store may wait on another process's write lock for HOOK_DB_BUDGET_MS in all, never DB_TIMEOUT_MS
+  // per connection (that equals HOOK_TIMEOUT_MS, so the host killed the hook mid-wait).
+  limitBusyWait(HOOK_DB_BUDGET_MS);
   // Step 1: --agent <id>; unknown -> allow (no host shape to answer in).
   const i = argv.indexOf(AGENT_ARG);
   const agent = i >= 0 ? argv[i + 1] ?? "" : "";

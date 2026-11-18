@@ -2,7 +2,8 @@
 // Moved from tests/hooks/hook-fuzz.test.mjs. Test names and bodies unchanged.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { cpus, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, before, after, describe } from "node:test";
@@ -452,6 +453,26 @@ describe("PRD-v2 section 10: seeded hook fuzz on every host", () => {
     });
   }
 
+  // holdLock regressions (T271): one SessionStart call creates the project DB under caseHome, then a second connection
+  // takes the write lock and keeps it until the case's call has ended.
+  function findDb(dir) {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) { const hit = findDb(p); if (hit !== null) return hit; } else if (e.name === "context.db") return p;
+    }
+    return null;
+  }
+
+  async function holdProjectLock(host, env, caseHome) {
+    const warm = await runHook(host, JSON.stringify({ session_id: "s0", cwd: repoDir, hook_event_name: "SessionStart", source: "startup" }), env, repoDir);
+    assert.equal(warm.status, 0, "holdLock warm-up call failed: " + warm.stderr);
+    const db = findDb(caseHome);
+    assert.notEqual(db, null, "holdLock warm-up created no context.db under " + caseHome);
+    const holder = new DatabaseSync(db, { timeout: 100 });
+    holder.exec("BEGIN IMMEDIATE");
+    return holder;
+  }
+
   // Named regression cases: each was a crash the fuzz found. They run once per listed host with a fixed stdin.
   test("hook-fuzz regressions: every named crash case now exits 0 with a valid answer", async () => {
     const home = mkdtempSync(join(root, "home-reg-"));
@@ -459,9 +480,16 @@ describe("PRD-v2 section 10: seeded hook fuzz on every host", () => {
     for (const c of REGRESSIONS) {
       for (const host of c.hosts === "all" ? HOSTS : c.hosts) {
         const stdin = typeof c.stdin === "function" ? c.stdin(host, { repoDir, spaceDir, lockedDir, root }) : c.stdin;
-        const env = { PATH: process.env.PATH ?? "", ...(c.noHome ? {} : { HOME: home, USERPROFILE: home }) };
+        const caseHome = c.holdLock ? mkdtempSync(join(root, "home-lock-")) : home;
+        const env = { PATH: process.env.PATH ?? "", ...(c.noHome ? {} : { HOME: caseHome, USERPROFILE: caseHome }) };
         if (process.env.SystemRoot !== undefined) env.SystemRoot = process.env.SystemRoot;
-        const res = await runHook(host, stdin, env, repoDir);
+        const holder = c.holdLock ? await holdProjectLock(host, env, caseHome) : null;
+        let res;
+        try {
+          res = await runHook(host, stdin, env, repoDir);
+        } finally {
+          if (holder !== null) { holder.exec("ROLLBACK"); holder.close(); }
+        }
         const pr = problems(host, { own: namesOwnTool(host, stdin) }, res);
         if (pr.length > 0) bad.push({ regression: c.name, host, problems: pr, stderr: res.stderr.slice(0, 300) });
       }

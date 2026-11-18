@@ -9,8 +9,9 @@ export const SCHEMA_VERSION: number = SCHEMA_VERSION_CONST;
 // Connection pragmas. They run before BEGIN IMMEDIATE, never inside it: SQLite ignores
 // `PRAGMA journal_mode = WAL` inside a transaction (DEVIATIONS D-M1-T4-1).
 // busy_timeout first so a concurrent opener waits instead of failing on the WAL switch.
-const PRAGMAS = `
-PRAGMA busy_timeout = ${DB_TIMEOUT_MS};
+// D-HOOK-BUSY-1: the caller passes the busy wait of its connection (a spawned hook passes what is left of its budget).
+const pragmas = (busyMs: number): string => `
+PRAGMA busy_timeout = ${busyMs};
 PRAGMA journal_mode = WAL;
 `;
 
@@ -149,12 +150,12 @@ const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
   { version: 6, sql: DDL_V6 },
 ];
 
-export function applyMigrations(db: DatabaseSync, fromVersion: number): void {
+export function applyMigrations(db: DatabaseSync, fromVersion: number, busyMs: number = DB_TIMEOUT_MS): void {
   if (fromVersion === SCHEMA_VERSION) return;
   if (fromVersion > SCHEMA_VERSION) {
     throw new CtxError("SCHEMA_STALE", { found: fromVersion, want: SCHEMA_VERSION });
   }
-  db.exec(PRAGMAS);
+  db.exec(pragmas(busyMs));
   db.exec("BEGIN IMMEDIATE");
   try {
     for (const step of MIGRATIONS) {

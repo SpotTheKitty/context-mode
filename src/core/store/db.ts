@@ -49,6 +49,22 @@ function isCorrupt(err: unknown): boolean {
 
 type SqliteModule = typeof import("node:sqlite");
 
+// D-HOOK-BUSY-1: null = every connection waits DB_TIMEOUT_MS on a lock (servers, CLI). A spawned hook sets a deadline
+// once at start; each connection it opens then waits at most what is left of it, so the hook answers and exits inside
+// the host's HOOK_TIMEOUT_MS even when another process holds the write lock. A wait past it fails as SQLITE_BUSY, which
+// the hook's guarded stages already turn into the host's failure answer (store) or one stderr line (detached write).
+let busyDeadline: number | null = null;
+
+/** D-HOOK-BUSY-1: from now on, all busy waits of this process share `budgetMs`. Called once by the hook entry. */
+export function limitBusyWait(budgetMs: number): void {
+  busyDeadline = Date.now() + budgetMs;
+}
+
+function busyMs(): number {
+  if (busyDeadline === null) return DB_TIMEOUT_MS;
+  return Math.max(0, Math.min(DB_TIMEOUT_MS, busyDeadline - Date.now()));
+}
+
 async function loadSqlite(): Promise<SqliteModule> {
   try {
     return await import("node:sqlite");
@@ -71,9 +87,9 @@ function createAtomically(sqlite: SqliteModule, path: string): void {
   const { randomUUID } = process.getBuiltinModule("node:crypto") as typeof import("node:crypto");
   const tmp = path + "." + randomUUID() + DB_TMP_SUFFIX;
   try {
-    const raw = new sqlite.DatabaseSync(tmp, { timeout: DB_TIMEOUT_MS });
+    const raw = new sqlite.DatabaseSync(tmp, { timeout: busyMs() });
     try {
-      applyMigrations(raw, readUserVersion(raw));
+      applyMigrations(raw, readUserVersion(raw), busyMs());
     } finally {
       raw.close(); // last connection: SQLite checkpoints and removes the temp -wal/-shm
     }
@@ -92,8 +108,8 @@ function openWritable(sqlite: SqliteModule, path: string): DatabaseSync {
   let raw: DatabaseSync | null = null;
   try {
     if (!existsSync(path)) createAtomically(sqlite, path);
-    raw = new sqlite.DatabaseSync(path, { timeout: DB_TIMEOUT_MS });
-    applyMigrations(raw, readUserVersion(raw));
+    raw = new sqlite.DatabaseSync(path, { timeout: busyMs() });
+    applyMigrations(raw, readUserVersion(raw), busyMs());
     return raw;
   } catch (err) {
     if (raw) raw.close();
@@ -103,7 +119,7 @@ function openWritable(sqlite: SqliteModule, path: string): DatabaseSync {
 
 // Read-only open (D-M1-T5-1): never migrates; a schema other than SCHEMA_VERSION is SCHEMA_STALE.
 function openReadOnly(sqlite: SqliteModule, path: string): DatabaseSync {
-  const raw = openReadOnlyHandle(sqlite, path); // D-R44-OC-SQLITE-RO-1
+  const raw = openReadOnlyHandle(sqlite, path, { timeout: busyMs() }); // D-R44-OC-SQLITE-RO-1, D-HOOK-BUSY-1
   try {
     const found = readUserVersion(raw);
     if (found !== SCHEMA_VERSION) throw new CtxError("SCHEMA_STALE", { found, want: SCHEMA_VERSION });

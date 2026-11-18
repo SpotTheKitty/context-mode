@@ -6,10 +6,11 @@ import { DB_TIMEOUT_MS } from "../contracts/constants.ts";
 
 type SqliteModule = typeof import("node:sqlite");
 
-export function openReadOnlyHandle(sqlite: SqliteModule, path: string, opts: { queryOnly?: boolean; bun?: string | undefined } = {}): DatabaseSync {
+export function openReadOnlyHandle(sqlite: SqliteModule, path: string, opts: { queryOnly?: boolean; bun?: string | undefined; timeout?: number } = {}): DatabaseSync {
   const bun = "bun" in opts ? opts.bun : process.versions.bun;
-  if (bun === undefined) return new sqlite.DatabaseSync(path, { timeout: DB_TIMEOUT_MS, readOnly: true });
-  const raw = new sqlite.DatabaseSync(path, { timeout: DB_TIMEOUT_MS });
+  const timeout = opts.timeout ?? DB_TIMEOUT_MS; // D-HOOK-BUSY-1
+  if (bun === undefined) return new sqlite.DatabaseSync(path, { timeout, readOnly: true });
+  const raw = new sqlite.DatabaseSync(path, { timeout });
   if (opts.queryOnly !== false) raw.exec("PRAGMA query_only = ON");
   return raw;
 }

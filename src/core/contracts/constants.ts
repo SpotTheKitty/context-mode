@@ -117,6 +117,9 @@ export const HOOK_P95_MS = 40; // GS6, DECISIONS-r9 V14: Claude Code wall
 export const HOOK_CPU_OVER_NODE_MS = 20; // GS6: command hooks, CPU over bare Node
 export const HOOK_COMBINED_P95_MS = 60; // GS6, A31: command hooks, wall
 export const HOOK_TIMEOUT_MS = 5000; // impl/10 A2: hookTimeoutMs for spawn-based agents
+// D-HOOK-BUSY-1: a spawned hook's SQLite busy waits share this budget, counted from the hook's start. DB_TIMEOUT_MS equals
+// HOOK_TIMEOUT_MS, so one wait on a held write lock used the host's whole deadline and a second one doubled it.
+export const HOOK_DB_BUDGET_MS = 1500;
 export const EXIT_SIGTERM_MS = 2000; // GP9, #862
 export const EXIT_SIGKILL_MS = 5000; // GP9, #862
 export const GP9_EXIT_MS = 2000; // impl/14 harness lifecycle budget; TECH-SPEC GP9 "exit < 2 s"
