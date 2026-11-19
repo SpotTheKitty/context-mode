@@ -6,8 +6,7 @@
 import type { HookOutput } from "../core/contracts/types.ts";
 import { AGENT_IDS, type AgentId } from "../core/contracts/agents.ts";
 import { AGENT_ARG, HOOK_DB_BUDGET_MS } from "../core/contracts/constants.ts";
-import { failureOutput, handleHook, logHookError, readStdin, writeOut } from "../core/hooks/dispatch.ts";
-import { limitBusyWait } from "../core/store/db.ts";
+import { failureOutput, handleHook, limitBusyWait, logHookError, readStdin, writeOut } from "../core/hooks/dispatch.ts";
 
 const EMPTY: HookOutput = { stdout: "", exitCode: 0 };
 

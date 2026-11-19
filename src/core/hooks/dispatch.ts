@@ -45,6 +45,7 @@ import { failureOutput, fault, logHookError, nodeTooOld } from "./fallback.ts";
 
 export { failureOutput, logHookError } from "./fallback.ts"; // D-HNE-GUARD-1: the entry's last-resort catch
 export { readStdin, writeOut } from "./io.ts"; // D-M7-HP-1: entry I/O without process.stdin/stdout streams
+export { limitBusyWait } from "../store/db.ts"; // D-HOOK-BUSY-1: the entry's store budget; the entry imports contracts + dispatch only
 
 const ALLOW: Decision = { kind: "allow" };
 const EMPTY: HookOutput = { stdout: "", exitCode: 0 };
