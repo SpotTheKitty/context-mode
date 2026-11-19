@@ -76,3 +76,10 @@ A second framed-transport fixture sends a notification and an unrelated response
 Long Windows unit runs hand off the existing T202 lock between completed files before its maximum hold could expire; they reacquire before starting another file. The shared record format and other checkouts are unchanged. Zcode schema fixtures are initialized from declarative registry data so setup rollback after an unrelated runtime probe cannot erase their input. See TEST-LAYOUT.md for budgets, compatibility and regression evidence.
 
 The Copilot discovery descendant regression observes asynchronous Windows taskkill completion for at most thirty seconds. Its former one-second observation contradicted killTree's nonblocking D-1337-EXIT-SETTLE-1 contract and raced taskkill startup under machine load. Discovery and production hook deadlines remain unchanged; an owned descendant still alive after the bounded cleanup observation fails the test.
+# Workspace resolution and client hooks
+
+HTTP tools select `_workspace`, request `_meta.cwd`, Codex sandbox cwd, then the tool's `cwd`, in that order. When all are absent, the tenant's `defaultWorkspace`, server `defaultWorkspace`, session root from the endpoint table, then the server working directory provide a usable scope. A fallback is reported in the tool reply so callers can select a project explicitly. Tenant and project SQL isolation remains enforced; `ctx_stats` permits only the exact read-only `page_count` and `page_size` PRAGMAs needed for its size report.
+
+The HTTP Claude Code forwarder adds `_workspace` from native PreToolUse `cwd` through `hookSpecificOutput.updatedInput` for context-mode tools. It preserves existing input, explicit workspaces, deny decisions and other hook fields. It also injects on the existing fail-open path. Other clients use native metadata or the reported server fallback.
+
+Focused checks: `npm run typecheck` and `node --test tests/http-workspace.test.mjs`. The HTTP integration tests in `tests/0002-store.test.mjs` cover tenant isolation and flat deployment. No full suite is required for this focused change.

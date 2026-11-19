@@ -46,6 +46,7 @@ export function scopedWrite(sql: string, tenant: string, project: string): strin
   const scope = `tenant=${quote(tenant)} AND project_key=${quote(project)}`;
   const target = /^(\s*(?:INSERT(?: OR \w+)? INTO|UPDATE|DELETE FROM)\s+)(\w+)/i.exec(sql);
   if (!target) {
+    if (/^\s*PRAGMA (?:page_count|page_size)\s*;?\s*$/i.test(sql)) return sql;
     if (/^\s*(?:SELECT|WITH|BEGIN|COMMIT|ROLLBACK|PRAGMA wal_checkpoint)/i.test(sql)) return sql;
     throw new Error("HTTP store refuses unscoped SQL");
   }
