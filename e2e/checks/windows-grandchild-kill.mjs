@@ -28,6 +28,19 @@ if (process.platform !== "win32") {
 const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const SERVER_BUNDLE = path.join(REPO_ROOT, "release-out", "server.mjs");
 
+// T938: release-out/ is gitignored and the local suite runner (scripts/test-suite.mjs)
+// builds only --generated-only, so a fresh checkout has no bundle. The check owns
+// this precondition and builds it with the repo's own build command when missing,
+// the same build CI runs before this check. Without it node exits 1 (MODULE_NOT_FOUND)
+// before replying and the run fails at e2e/harness/mcp-client.mjs:50 with no cause.
+if (!existsSync(SERVER_BUNDLE)) {
+  const built = spawnSync(process.execPath, [path.join(REPO_ROOT, "build", "build.mjs"), "--out", "release-out"], { cwd: REPO_ROOT, encoding: "utf8" });
+  if (built.status !== 0 || !existsSync(SERVER_BUNDLE)) {
+    console.log(JSON.stringify({ ok: false, error: "bundle build failed", status: built.status, stdout: built.stdout, stderr: built.stderr }));
+    process.exit(1);
+  }
+}
+
 // KILL_GRACE_MS lives only in src/core/contracts/constants.ts; read it as text (no src import, D-M7-B1-1).
 const text = readFileSync(path.join(REPO_ROOT, "src", "core", "contracts", "constants.ts"), "utf8");
 const key = "export const KILL_GRACE_MS = ";
