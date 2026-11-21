@@ -4,7 +4,7 @@
 // outcome at once, the worker is terminated, and the pool keeps counting the thread until it has exited
 // (node:sqlite has no interrupt, so a statement already inside SQLite finishes before the thread can end).
 import { Worker } from "node:worker_threads";
-import type { AgentId, ToolReply } from "../core/contracts/types.ts";
+import type { AgentId, HookOutput, ToolReply } from "../core/contracts/types.ts";
 import type { ProjectSourceInput } from "../core/project/resolve.ts";
 
 /** The worker resolves the project itself from `source`: a resolved ProjectContext has lazy getters, and
@@ -16,35 +16,41 @@ export interface SearchJob {
   stallMs?: number;
 }
 /** started=false: the budget ran out while every worker was busy, so the search never began. */
-export type SearchOutcome = { kind: "reply"; reply: ToolReply } | { kind: "timeout"; started: boolean } | { kind: "failed"; message: string };
-export type SearchWorkerMessage = { id: number; reply: ToolReply } | { id: number; error: string };
+export interface HookJob {
+  adapter: AgentId; raw: unknown; env: NodeJS.ProcessEnv;
+  tenant: string; database: string; toolPrefix?: string;
+}
+type WorkerOutcome<Reply> = { kind: "reply"; reply: Reply } | { kind: "timeout"; started: boolean } | { kind: "failed"; message: string };
+export type WorkerMessage = { id: number; reply: ToolReply | HookOutput } | { id: number; error: string };
 export const SEARCH_WORKER_ROLE = "context-mode-search";
 
-interface Slot { worker: Worker; job: Pending | null; }
-interface Pending { id: number; job: SearchJob; resolve(outcome: SearchOutcome): void; timer: NodeJS.Timeout; slot: Slot | null; }
+interface Slot<Job, Reply> { worker: Worker; job: Pending<Job, Reply> | null; }
+interface Pending<Job, Reply> { id: number; job: Job; resolve(outcome: WorkerOutcome<Reply>): void; timer: NodeJS.Timeout; slot: Slot<Job, Reply> | null; }
 
-export class SearchPool {
-  private readonly idle: Slot[] = [];
-  private readonly busy = new Set<Slot>();
+export class RequestPool<Job extends SearchJob | HookJob, Reply extends ToolReply | HookOutput> {
+  private readonly idle: Slot<Job, Reply>[] = [];
+  private readonly busy = new Set<Slot<Job, Reply>>();
   /** Terminated workers whose thread has not exited yet; they still count against `size`. */
   private readonly leaving = new Set<Worker>();
-  private queue: Pending[] = [];
+  private queue: Pending<Job, Reply>[] = [];
   private next = 1;
   private closed = false;
 
   private readonly entry: string;
   private readonly size: number;
+  private readonly name: string;
 
-  constructor(entry: string, size: number) {
+  constructor(entry: string, size: number, name: string) {
     this.entry = entry;
     this.size = size;
+    this.name = name;
   }
 
   /** The budget starts now, so time spent waiting for a free worker is part of it. */
-  run(job: SearchJob, budgetMs: number): Promise<SearchOutcome> {
-    if (this.closed) return Promise.resolve({ kind: "failed", message: "search pool closed" });
+  run(job: Job, budgetMs: number): Promise<WorkerOutcome<Reply>> {
+    if (this.closed) return Promise.resolve({ kind: "failed", message: this.name + " pool closed" });
     return new Promise((resolve) => {
-      const pending: Pending = { id: this.next++, job, resolve, slot: null, timer: setTimeout(() => this.expire(pending), budgetMs) };
+      const pending: Pending<Job, Reply> = { id: this.next++, job, resolve, slot: null, timer: setTimeout(() => this.expire(pending), budgetMs) };
       this.queue.push(pending);
       this.pump();
     });
@@ -54,11 +60,11 @@ export class SearchPool {
     this.closed = true;
     for (const pending of this.queue.splice(0)) {
       clearTimeout(pending.timer);
-      pending.resolve({ kind: "failed", message: "search pool closed" });
+      pending.resolve({ kind: "failed", message: this.name + " pool closed" });
     }
     const slots = [...this.idle, ...this.busy];
     for (const slot of slots) {
-      if (slot.job) { clearTimeout(slot.job.timer); slot.job.resolve({ kind: "failed", message: "search pool closed" }); slot.job = null; }
+      if (slot.job) { clearTimeout(slot.job.timer); slot.job.resolve({ kind: "failed", message: this.name + " pool closed" }); slot.job = null; }
     }
     this.idle.length = 0;
     this.busy.clear();
@@ -72,7 +78,7 @@ export class SearchPool {
         if (this.idle.length + this.busy.size + this.leaving.size >= this.size) return;
         slot = this.spawn();
       }
-      const pending = this.queue.shift() as Pending;
+      const pending = this.queue.shift()!;
       pending.slot = slot;
       slot.job = pending;
       this.busy.add(slot);
@@ -80,29 +86,29 @@ export class SearchPool {
     }
   }
 
-  private spawn(): Slot {
+  private spawn(): Slot<Job, Reply> {
     const worker = new Worker(this.entry, { workerData: { role: SEARCH_WORKER_ROLE } });
-    const slot: Slot = { worker, job: null };
-    worker.on("message", (message: SearchWorkerMessage) => {
+    const slot: Slot<Job, Reply> = { worker, job: null };
+    worker.on("message", (message: WorkerMessage) => {
       const pending = slot.job;
       if (pending === null || pending.id !== message.id) return;
       clearTimeout(pending.timer);
       slot.job = null;
       this.busy.delete(slot);
       this.idle.push(slot);
-      pending.resolve("error" in message ? { kind: "failed", message: message.error } : { kind: "reply", reply: message.reply });
+      pending.resolve("error" in message ? { kind: "failed", message: message.error } : { kind: "reply", reply: message.reply as Reply });
       this.pump();
     });
     worker.on("error", (error) => this.lose(slot, error.message));
     worker.on("exit", () => {
       this.leaving.delete(worker);
-      this.lose(slot, "search worker exited");
+      this.lose(slot, this.name + " worker exited");
       if (!this.closed) this.pump();
     });
     return slot;
   }
 
-  private lose(slot: Slot, message: string): void {
+  private lose(slot: Slot<Job, Reply>, message: string): void {
     const pending = slot.job;
     slot.job = null;
     this.busy.delete(slot);
@@ -114,7 +120,7 @@ export class SearchPool {
     }
   }
 
-  private expire(pending: Pending): void {
+  private expire(pending: Pending<Job, Reply>): void {
     const slot = pending.slot;
     if (slot === null) {
       this.queue = this.queue.filter((p) => p !== pending);

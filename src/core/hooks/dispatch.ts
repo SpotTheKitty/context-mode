@@ -84,6 +84,9 @@ export async function handleHook(agent: AgentId, raw: unknown, env: NodeJS.Proce
   try {
     fault(env, "decode");
     ev = row.decode(raw);
+    if (prefix && ev.tool?.name.startsWith(prefix + OWN_TOOL_PREFIX)) {
+      ev.tool.canonicalName = ev.tool.name.slice(prefix.length);
+    }
   } catch (err) {
     return fail("decode", err); // step 2
   }

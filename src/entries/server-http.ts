@@ -8,13 +8,12 @@ import { McpServer, WebStandardStreamableHTTPServerTransport, type StandardSchem
 import { z } from "zod/v4";
 import { TOOLS } from "../core/tools/registry.ts";
 import { resolveProject } from "../core/project/resolve.ts";
-import { handleHook } from "../core/hooks/dispatch.ts";
 import { appendEvent, ownCallRow } from "../core/journal/append.ts";
 import { closeDb, openDb } from "../core/store/db.ts";
 import { httpScope, settleHttpScope } from "../core/store/http-scope.ts";
-import type { AgentId, ToolContext, ToolReply } from "../core/contracts/types.ts";
-import { DB_FILE_NAME } from "../core/contracts/constants.ts";
-import { SEARCH_WORKER_ROLE, SearchPool } from "./search-pool.ts";
+import type { AgentId, HookOutput, ToolContext, ToolReply } from "../core/contracts/types.ts";
+import { DB_FILE_NAME, HOOK_TIMEOUT_MS } from "../core/contracts/constants.ts";
+import { SEARCH_WORKER_ROLE, RequestPool, type HookJob, type SearchJob } from "./search-pool.ts";
 import { serveSearchWorker, stallSync } from "./search-worker.ts";
 
 export interface HttpConfig {
@@ -25,6 +24,7 @@ export interface HttpConfig {
   searchTimeoutMs?: number;
   /** T230: worker threads that run searches. Default SEARCH_WORKERS; 0 runs a search on the request path (no bound). */
   searchWorkers?: number;
+  hookTimeoutMs?: number;
 }
 /** Test seam: `searchStall` returns how long to block the thread that runs a search before it starts, as a long SQLite statement would. */
 export interface HttpOptions { searchStall?: (args: unknown) => number; }
@@ -58,9 +58,15 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
   const env = environment(config);
   const searchTimeoutMs = config.searchTimeoutMs ?? SEARCH_TIMEOUT_MS;
   const searchWorkers = config.searchWorkers ?? SEARCH_WORKERS;
+  const hookTimeoutMs = config.hookTimeoutMs ?? HOOK_TIMEOUT_MS;
   if (!(searchTimeoutMs > 0) || !Number.isInteger(searchWorkers) || searchWorkers < 0) throw new Error("invalid contextMode searchTimeoutMs or searchWorkers");
   // Workers load this same file (the flat bundle has no other), so the entry is our own URL.
-  const pool = searchWorkers > 0 ? new SearchPool(fileURLToPath(import.meta.url), searchWorkers) : null;
+  if (!(hookTimeoutMs > 0)) throw new Error("invalid contextMode hookTimeoutMs");
+  const entry = fileURLToPath(import.meta.url);
+  const pool = searchWorkers > 0 ? new RequestPool<SearchJob, ToolReply>(entry, searchWorkers, "search") : null;
+  // Keep hook indexing and SQLite lock waits off the listener. A single worker orders hook writes
+  // and prevents hook traffic from consuming the search workers.
+  const hooks = new RequestPool<HookJob, HookOutput>(entry, 1, "hook");
   const host = createHttpServer(async (incoming,outgoing) => {
     try {
       const url = new URL(incoming.url ?? "/", `http://${config.host}`);
@@ -84,12 +90,16 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
           const adapter = wrapped ? input.adapter as AgentId : agent;
           const adapters = config.tenants[tenant]!.hookAdapters;
           if (adapter !== agent && !Object.hasOwn(adapters ?? {},adapter)) {outgoing.writeHead(403).end("unknown hook adapter");return;}
-          const scope = httpScope.getStore()!;
-          scope.toolPrefix = adapters?.[adapter]?.toolPrefix ?? config.tenants[tenant]!.toolPrefix;
+          const toolPrefix = adapters?.[adapter]?.toolPrefix ?? config.tenants[tenant]!.toolPrefix;
           const raw: unknown = wrapped ? input.raw : input;
-          let answer;
-          try {answer = await handleHook(adapter,raw,env);} finally {await settleHttpScope();}
-          outgoing.setHeader("Content-Type","application/json"); outgoing.end(JSON.stringify(answer)); return;
+          const result = await hooks.run({adapter,raw,env,tenant,database,toolPrefix},hookTimeoutMs);
+          if (result.kind !== "reply") {
+            const reason = result.kind === "failed" ? result.message : `context-mode hook exceeded ${hookTimeoutMs} ms (hookTimeoutMs)`;
+            console.error(reason);
+            outgoing.writeHead(503).end(reason);
+            return;
+          }
+          outgoing.setHeader("Content-Type","application/json"); outgoing.end(JSON.stringify(result.reply)); return;
         }
         const server = new McpServer({name:"context-mode",version:"tenant-http"});
         // Machine-wide install/repair tools are deliberately unavailable on a shared tenant
@@ -145,7 +155,7 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
     } catch (e) {console.error("context-mode HTTP request failed", e); if (!outgoing.headersSent) outgoing.writeHead(500); outgoing.end("request failed");}
   });
   await new Promise<void>((resolve,reject)=>{host.once("error",reject);host.listen(config.port,config.host,()=>{host.off("error",reject);resolve();});});
-  host.once("close",() => {void pool?.close();});
+  host.once("close",() => {void pool?.close(); void hooks.close();});
   return host;
 }
 
