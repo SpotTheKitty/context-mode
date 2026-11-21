@@ -2309,7 +2309,7 @@ describe("PRD-v2 section 10: saving on live payload shapes", () => {
     const content = readFileSync(file, "utf8");
     assert.ok(Buffer.byteLength(content) > REPLACE_TRIGGER_BYTES);
     const out = await handleHook("copilot-cli", { hookEventName: "postToolUse", sessionId: "c1", cwd: repo,
-      toolName: "session_artifacts", toolArgs: { action: "read", path: artifact },
+      toolName: "session_artifacts", toolArgs: { operation: "read", path: artifact },
       toolResult: { resultType: "success", textResultForLlm: content } }, env);
     assert.equal(out.exitCode, 0);
     const delivered = out.stdout === "" ? content : JSON.parse(out.stdout).modifiedResult?.textResultForLlm;

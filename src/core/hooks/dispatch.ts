@@ -452,7 +452,7 @@ async function postToolUse(ev: CanonicalHookEvent, row: AdapterRow, project: Pro
 
 /** Explicit file reads deliver the requested content through the host's own read interface. */
 function namedFileRead(tool: ToolCall): boolean {
-  if (tool.canonicalName === "session_artifacts") return tool.input.action === "read";
+  if (tool.canonicalName === "session_artifacts") return tool.input.operation === "read";
   return (RANGE_READ_TOOLS.includes(tool.canonicalName) || ["read", "read_file"].includes(tool.canonicalName)) &&
     READ_PATH_KEYS.some((key) => typeof tool.input[key] === "string" && tool.input[key] !== "");
 }
