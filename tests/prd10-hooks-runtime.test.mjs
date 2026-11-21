@@ -267,7 +267,7 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
   }
 
   function subagentPost(text, type) {
-    return cc({ hook_event_name: "PostToolUse", agent_id: "sub-1", agent_type: type, tool_name: "Read", tool_input: { file_path: "/big.log", description: "needle target" }, tool_response: text });
+    return cc({ hook_event_name: "PostToolUse", agent_id: "sub-1", agent_type: type, tool_name: "Grep", tool_input: { path: "/big.log", pattern: "needle", description: "needle target" }, tool_response: text });
   }
 
   test("case C under OUTPUT_CAP: allow, nothing indexed", async () => {
@@ -285,7 +285,7 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
     const src = query("SELECT label, bytes_total FROM sources WHERE session_id = ?", p.session_id);
     // bytes_total is the sum of chunk bytes (store rule): the trailing newline is not a chunk byte.
     assert.equal(src.length, 1);
-    assert.equal(src[0].label, "subagent:Read:0");
+    assert.equal(src[0].label, "subagent:Grep:0");
     assert.ok(src[0].bytes_total >= Buffer.byteLength(text) - 1, "the whole text is indexed, nothing cut");
     // Whole chunks only: the selected chunks, joined by one "\n", make up the body byte for byte.
     const body = replaced.slice(0, replaced.lastIndexOf("\n" + CCP + "ctx_search(") < 0 ? replaced.length : replaced.lastIndexOf("\n" + CCP + "ctx_search("));
@@ -402,25 +402,6 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
     assert.ok(r.text.includes(src[0].label + " #" + gone.ord + ":"), "ctx_search finds the dropped chunk: ord " + gone.ord + " num " + num + "\n" + r.text.slice(0, 600));
   });
 
-  test("D-CC-SHAPE-1 (#1304): main-agent Read over the trigger: updatedToolOutput is Read's file object, never a string", async () => {
-    const text = bigText(40000);
-    const n = text.split("\n").length;
-    const file = { filePath: "/big.log", content: text, numLines: n, startLine: 1, totalLines: n };
-    const p = cc({ hook_event_name: "PostToolUse", tool_name: "Read", tool_use_id: "toolu_read_1", tool_input: { file_path: "/big.log" }, tool_response: { type: "text", file } });
-    const out = parsed(await handleHook("claude-code", p, env));
-    const r = out.updatedToolOutput;
-    assert.equal(typeof r, "object", "Read replace is an object (Claude Code drops a string)");
-    assert.equal(r.type, "text");
-    // D-R33-CC-READ-LINES-1: startLine and numLines follow the kept lines; every other file field is kept.
-    assert.deepEqual({ ...r.file, content: "", startLine: 0, numLines: 0 }, { ...file, content: "", startLine: 0, numLines: 0 }, "every other file field is kept");
-    const shown = r.file.content.split("\n");
-    assert.equal(r.file.numLines, shown.length);
-    const lines = text.split("\n");
-    for (let i = 0; i < shown.length - 1; i++) assert.equal(shown[i], lines[r.file.startLine - 1 + i], "line " + (r.file.startLine + i) + " is that file line");
-    assert.ok(Buffer.byteLength(r.file.content) < Buffer.byteLength(text), "the content is replaced");
-    assert.ok(r.file.content.includes(CCP + "ctx_search("), "the more line names ctx_search");
-  });
-
   test("D-M7-RR-3: no Bash description: the intent is the command text, never an empty query", async () => {
     const p = mainBashPost(bigText(40000), undefined);
     delete p.tool_input.description;
@@ -431,8 +412,8 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
     assert.ok(more.includes("cat big.log"), "the more line queries the command text: " + more);
   });
 
-  test("D-M7-RR-3: no description on Read, Grep, WebFetch: file path, pattern, URL are the intent", async () => {
-    for (const [tool, input, want] of [["Read", { file_path: "/tmp/big.log" }, "/tmp/big.log"], ["Grep", { pattern: "needle target" }, "needle target"], ["WebFetch", { url: "https://example.com/x" }, "https://example.com/x"]]) {
+  test("D-M7-RR-3: no description on Grep or WebFetch: pattern or URL is the intent", async () => {
+    for (const [tool, input, want] of [["Grep", { pattern: "needle target" }, "needle target"], ["WebFetch", { url: "https://example.com/x" }, "https://example.com/x"]]) {
       const p = cc({ hook_event_name: "PostToolUse", tool_name: tool, tool_input: input, tool_use_id: "toolu_" + tool, tool_response: bigText(40000) });
       const out = parsed(await handleHook("claude-code", p, env));
       if (typeof out.updatedToolOutput !== "string") continue; // row has no replace channel for this tool
@@ -444,7 +425,7 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
   });
 
   // D-R41-READ-OFFSET-1 (#1314, joucarvalho): "Read with offset/limit over 4 KB comes back as a 96 B ctx_search pointer".
-  // A bounded Read is the user's own small window: the host's result reaches the model whole. A full Read still replaces.
+  // A bounded Read is the user's own small window: the host's result reaches the model whole. A named full Read also reaches the model whole.
   test("D-R41-READ-OFFSET-1: a Read with offset or limit over REPLACE_TRIGGER_BYTES is never replaced (#1314)", async () => {
     const content = bigText(REPLACE_TRIGGER_BYTES * 3);
     const n = content.split("\n").length;
@@ -454,11 +435,11 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
       assert.equal(parsed(await handleHook("claude-code", p, env)), null, JSON.stringify(input));
     }
     const full = cc({ hook_event_name: "PostToolUse", tool_name: "Read", tool_input: { file_path: "/tmp/big.log" }, tool_use_id: "toolu_f", tool_response: { type: "text", file } });
-    assert.equal(typeof parsed(await handleHook("claude-code", full, env)).updatedToolOutput, "object", "a full Read over the trigger still replaces");
+    assert.equal(parsed(await handleHook("claude-code", full, env)), null, "a named full Read reaches the model whole");
   });
 
   // D-R48-OWN-FILE-1 (#1326): "skill references and rule files under ~/.claude no longer load in full". A full Read of the
-  // agent's own skill file over the trigger reaches the model whole; a project file of the same size still replaces.
+  // agent's own skill file over the trigger reaches the model whole; a named project file of the same size does too.
   test("D-R48-OWN-FILE-1: a full Read of a skill reference under ~/.claude is never replaced (#1326)", async () => {
     const content = bigText(REPLACE_TRIGGER_BYTES * 3);
     const n = content.split("\n").length;
@@ -470,7 +451,7 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
     assert.equal(parsed(await handleHook("claude-code", p, env)), null);
     const proj = join(repo, "big.md");
     const q = cc({ hook_event_name: "PostToolUse", tool_name: "Read", tool_input: { file_path: proj }, tool_use_id: "toolu_proj", tool_response: { type: "text", file: { ...own, filePath: proj } } });
-    assert.equal(typeof parsed(await handleHook("claude-code", q, env)).updatedToolOutput, "object", "a project file still replaces");
+    assert.equal(parsed(await handleHook("claude-code", q, env)), null, "a named project file reaches the model whole");
   });
 
   test("D-M7-RR-1: main-agent replace above SYNC_INDEX_MAX_BYTES: in-memory selection, detached index", async () => {
@@ -796,7 +777,7 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
 
   test("D-CR3-HANDLE-1: a subagent replacement carries the same handle line", async () => {
     const text = bigText(40000);
-    const p = cc({ hook_event_name: "PostToolUse", tool_name: "Read", agent_id: "a1", agent_type: "general-purpose", tool_input: { file_path: "/tmp/big.log" }, tool_use_id: "toolu_sub", tool_response: text });
+    const p = cc({ hook_event_name: "PostToolUse", tool_name: "Grep", agent_id: "a1", agent_type: "general-purpose", tool_input: { path: "/tmp/big.log", pattern: "needle" }, tool_use_id: "toolu_sub", tool_response: text });
     const out = parsed(await handleHook("claude-code", p, env));
     if (out === null || typeof out.updatedToolOutput !== "string") return; // no subagent replace for this shape
     const replaced = out.updatedToolOutput;
@@ -2318,6 +2299,21 @@ describe("PRD-v2 section 10: saving on live payload shapes", () => {
     assert.equal(j.modifiedResult.resultType, "success");
     assert.ok(Buffer.byteLength(j.modifiedResult.textResultForLlm) < Buffer.byteLength(big) / 2, "replaced text is under half the raw output");
     assert.ok(j.modifiedResult.textResultForLlm.includes("ctx_search("), "the replace names ctx_search for the rest");
+  });
+
+  test("T990: Copilot session_artifacts delivers a large checkpoint whole", async (t) => {
+    const { repo, big, env } = sandbox(t);
+    const artifact = "checkpoint.md";
+    const file = join(repo, artifact);
+    writeFileSync(file, "# T990 checkpoint\n" + big);
+    const content = readFileSync(file, "utf8");
+    assert.ok(Buffer.byteLength(content) > REPLACE_TRIGGER_BYTES);
+    const out = await handleHook("copilot-cli", { hookEventName: "postToolUse", sessionId: "c1", cwd: repo,
+      toolName: "session_artifacts", toolArgs: { action: "read", path: artifact },
+      toolResult: { resultType: "success", textResultForLlm: content } }, env);
+    assert.equal(out.exitCode, 0);
+    const delivered = out.stdout === "" ? content : JSON.parse(out.stdout).modifiedResult?.textResultForLlm;
+    assert.ok(delivered === content, "the model receives the entire checkpoint");
   });
 
   test("copilot-cli snake_case PostToolUse reads tool_result.text_result_for_llm", () => {

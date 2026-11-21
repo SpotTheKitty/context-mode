@@ -19,7 +19,6 @@ import type {
 } from "../contracts/types.ts";
 import { getAdapter, hasRecall, hasReplace } from "../../adapters/table.ts";
 import { decide } from "../policy/decide.ts";
-import { isOwnFile } from "../policy/own-file.ts";
 import { isSubagentCall, pickSubagentCase, toolSetForAgentType } from "../policy/subagent.ts";
 import { readUserDeny } from "../policy/user-deny.ts";
 import { resolveProject } from "../project/resolve.ts";
@@ -451,11 +450,11 @@ async function postToolUse(ev: CanonicalHookEvent, row: AdapterRow, project: Pro
   return decision;
 }
 
-/** D-R48-OWN-FILE-1 (#1326): a read-like tool whose target is one of the agent's own instruction or skill files. */
-function ownRead(ev: CanonicalHookEvent, tool: ToolCall, env: NodeJS.ProcessEnv): boolean {
-  if (!RANGE_READ_TOOLS.includes(tool.canonicalName)) return false;
-  const p = READ_PATH_KEYS.map((k) => tool.input[k]).find((v): v is string => typeof v === "string" && v !== "");
-  return p !== undefined && isOwnFile(ev.agent, resolve(ev.cwd, p), env);
+/** Explicit file reads deliver the requested content through the host's own read interface. */
+function namedFileRead(tool: ToolCall): boolean {
+  if (tool.canonicalName === "session_artifacts") return tool.input.action === "read";
+  return (RANGE_READ_TOOLS.includes(tool.canonicalName) || ["read", "read_file"].includes(tool.canonicalName)) &&
+    READ_PATH_KEYS.some((key) => typeof tool.input[key] === "string" && tool.input[key] !== "");
 }
 
 async function postReplace(ev: CanonicalHookEvent, row: AdapterRow, project: ProjectContext, env: NodeJS.ProcessEnv,
@@ -464,7 +463,7 @@ async function postReplace(ev: CanonicalHookEvent, row: AdapterRow, project: Pro
   // with a replace channel ("run, then replace", D-M7-RR-1, DECISIONS-r10 (1)).
   if (result.bytes <= REPLACE_TRIGGER_BYTES) return ALLOW; // D-M7-SV-1
   if (boundedRead(tool)) return ALLOW; // D-R41-READ-OFFSET-1 (#1314): the user asked for these lines
-  if (ownRead(ev, tool, env)) return ALLOW; // D-R48-OWN-FILE-1 (#1326): a skill or rule file reaches the model whole
+  if (namedFileRead(tool)) return ALLOW; // T990: keep named reads intact
   if (result.keep === true) return ALLOW; // D-M2-MCP-1: an MCP result with a non-text block stays as the host made it
   // ADR-0001: one path per row, no runtime fallback. A row with no replace channel gets no replace decision on
   // any path, the subagent one too (D-STATS-RET-2): its encoder drops it, so the model gets the whole output.
