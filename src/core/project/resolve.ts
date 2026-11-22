@@ -13,7 +13,7 @@ import {
 import { CtxError } from "../contracts/errors.ts";
 import type { ProjectContext, ProjectSourceKind } from "../contracts/types.ts";
 import { resolveConfigDir } from "./config-dir.ts";
-import { commonRoot } from "./contain.ts";
+import { containmentRootFor } from "./contain.ts";
 import { sha256Hex } from "./sha256.ts";
 import { httpScope } from "../store/http-scope.ts";
 
@@ -137,12 +137,12 @@ function git(dir: string, args: string[]): string[] {
 // D-M2-R7-1: a registered worktree outside that dir (git worktree add /elsewhere) is inside too:
 // the root is the deepest dir holding the repo's parent and every registered worktree, so
 // ctx_execute_file accepts what ctx_batch runs in, from every session of the project.
-function containmentRootOf(dir: string, commonDir: string): string {
+function containmentRootOf(dir: string, commonDir: string, worktree: string): string {
   const repoDir = basename(commonDir) === GIT_DIR_NAME ? dirname(commonDir) : commonDir;
   const worktrees = git(dir, ["worktree", "list", "--porcelain"])
     .filter((l) => l.startsWith(GIT_WORKTREE_LINE_PREFIX))
     .map((l) => l.slice(GIT_WORKTREE_LINE_PREFIX.length));
-  return commonRoot([dirname(repoDir), ...worktrees]);
+  return containmentRootFor(worktree, [dirname(repoDir), ...worktrees]);
 }
 
 /** impl/00 §4: resolve the project of this call from the agent's one named project source. */
@@ -185,7 +185,7 @@ export function resolveProject(agent: AgentId, src: ProjectSourceInput): Project
     },
     worktree,
     get containmentRoot(): string {
-      root ??= plain ?? containmentRootOf(dir, commonDir);
+      root ??= plain ?? containmentRootOf(dir, commonDir, worktree);
       return root;
     },
     agent,

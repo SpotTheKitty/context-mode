@@ -20,9 +20,9 @@ function components(p: string): string[] {
 }
 
 /** True only if realpath(p) has every component of realpath(root), in order, at the same index. */
-export function isInside(root: string, p: string): boolean {
-  const r = real(root);
-  const q = real(p);
+export function isInside(root: string, p: string, realOf: (p: string) => string | undefined = real): boolean {
+  const r = realOf(root);
+  const q = realOf(p);
   if (r === undefined || q === undefined) return false;
   const rc = components(r);
   const qc = components(q);
@@ -62,8 +62,8 @@ export function isInsideAny(roots: readonly string[], p: string): boolean {
  * D-M2-R7-1 (#954): the deepest dir that holds every path, by realpath components.
  * A path that cannot be realpath'd holds no files and is left out.
  */
-export function commonRoot(paths: string[]): string {
-  const reals = paths.map(real).filter((r): r is string => r !== undefined);
+export function commonRoot(paths: string[], realOf: (p: string) => string | undefined = real): string {
+  const reals = paths.map((p) => realOf(p)).filter((r): r is string => r !== undefined);
   if (reals.length === 0) throw new RangeError("commonRoot needs at least one existing path");
   const first = reals[0];
   let n = components(first).length;
@@ -77,6 +77,18 @@ export function commonRoot(paths: string[]): string {
   let q = first;
   while (components(q).length > n && dirname(q) !== q) q = dirname(q);
   return q;
+}
+
+/**
+ * T1055: the containment root of a project whose repo dir and registered worktrees are `paths`. One shared dir when
+ * every path sits under it (#954). Paths on different volumes share none (commonRoot would return a drive root that
+ * holds only some of them, so the caller's own worktree was refused as "outside the project"): then the root is the
+ * caller's own worktree, so a sibling worktree on another volume stays outside.
+ */
+export function containmentRootFor(worktree: string, paths: string[], realOf: (p: string) => string | undefined = real): string {
+  const root = commonRoot(paths, realOf);
+  const holdsAll = paths.every((p) => realOf(p) === undefined || isInside(root, p, realOf));
+  return holdsAll ? root : (realOf(worktree) ?? worktree);
 }
 
 /** D-SEC-V1-LINK-1: true when `p` sits lexically under `root` and some step below `root` on the way to `p` is a

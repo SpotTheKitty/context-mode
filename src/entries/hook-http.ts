@@ -9,10 +9,11 @@ export interface HookHttpConfig {
   dataDir: string; host: string; port: number; path: string; tenantHeader: string; hookTimeoutMs: number;
   tenants: Record<string,{agent:AgentId;toolPrefix?:string;hookAdapters?:Record<string,{toolPrefix?:string}>}>;
 }
-// Claude's native PreToolUse contract supports updatedInput. Preserve routing decisions
-// and all other hook output; only add missing workspace metadata to our own tools.
+// Claude's and Codex's native PreToolUse contracts support updatedInput. Preserve routing decisions
+// and all other hook output; only add missing workspace metadata to our own tools. Codex accepts
+// updatedInput only together with permissionDecision "allow" (T1055).
 export function injectWorkspace(out: HookOutput, raw: unknown, agent: AgentId, prefix = "mcp__contextMode__"): HookOutput {
-  if (agent !== "claude-code" || !raw || typeof raw !== "object") return out;
+  if ((agent !== "claude-code" && agent !== "codex") || !raw || typeof raw !== "object") return out;
   const input = raw as Record<string, unknown>;
   if (input.hook_event_name !== "PreToolUse" || typeof input.cwd !== "string" || !input.cwd ||
       typeof input.tool_name !== "string" || !input.tool_name.startsWith(prefix + "ctx_")) return out;
@@ -22,7 +23,8 @@ export function injectWorkspace(out: HookOutput, raw: unknown, agent: AgentId, p
     const body = out.stdout ? JSON.parse(out.stdout) : {};
     const specific = body.hookSpecificOutput ?? {};
     if (out.exitCode !== 0 || specific.permissionDecision === "deny") return out;
-    body.hookSpecificOutput = {...specific, hookEventName:"PreToolUse", updatedInput:{...toolInput,...specific.updatedInput,_workspace:specific.updatedInput?._workspace ?? input.cwd}};
+    const decision = agent === "codex" ? {permissionDecision:specific.permissionDecision ?? "allow"} : {};
+    body.hookSpecificOutput = {...specific, ...decision, hookEventName:"PreToolUse", updatedInput:{...toolInput,...specific.updatedInput,_workspace:specific.updatedInput?._workspace ?? input.cwd}};
     return {...out,stdout:JSON.stringify(body)};
   } catch {return out;}
 }
