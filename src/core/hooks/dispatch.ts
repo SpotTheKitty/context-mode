@@ -457,11 +457,20 @@ function namedFileRead(tool: ToolCall): boolean {
     READ_PATH_KEYS.some((key) => typeof tool.input[key] === "string" && tool.input[key] !== "");
 }
 
+/** T1011: the HTTP table's inlineLimits (data, keyed by tool name as sent or canonical) raise the trigger for a tool whose result the
+ *  model needs whole (memory search rows); every other tool keeps REPLACE_TRIGGER_BYTES. A limit below the general trigger changes nothing. */
+function replaceTrigger(tool: ToolCall): number {
+  const limits = httpScope.getStore()?.inlineLimits;
+  if (limits === undefined) return REPLACE_TRIGGER_BYTES;
+  const own = [tool.name, tool.canonicalName].find((key) => Object.hasOwn(limits, key));
+  return own === undefined ? REPLACE_TRIGGER_BYTES : Math.max(limits[own]!, REPLACE_TRIGGER_BYTES);
+}
+
 async function postReplace(ev: CanonicalHookEvent, row: AdapterRow, project: ProjectContext, env: NodeJS.ProcessEnv,
   tool: ToolCall, result: ToolResultInfo, text: string): Promise<Decision> {
   // step 5: replace, DECISIONS-r9 F1 split. Subagent case B/C (ADR-0016), and the main agent on a row
   // with a replace channel ("run, then replace", D-M7-RR-1, DECISIONS-r10 (1)).
-  if (result.bytes <= REPLACE_TRIGGER_BYTES) return ALLOW; // D-M7-SV-1
+  if (result.bytes <= replaceTrigger(tool)) return ALLOW; // D-M7-SV-1
   if (boundedRead(tool)) return ALLOW; // D-R41-READ-OFFSET-1 (#1314): the user asked for these lines
   if (namedFileRead(tool)) return ALLOW; // T990: keep named reads intact
   if (result.keep === true) return ALLOW; // D-M2-MCP-1: an MCP result with a non-text block stays as the host made it

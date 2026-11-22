@@ -101,3 +101,31 @@ test("the diversion pointer reaches the stored text from a folder outside the se
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+// T1011: a memory search reply (about 1 KB a row, 8.2 KB at limit 8) is returned whole when the data table lists the tool in
+// inlineLimits; the same size from any other tool is still diverted at the general threshold.
+test("a tool listed in inlineLimits is returned whole up to its limit; others are still diverted", async () => {
+  const base = mkdtempSync(join(tmpdir(), "cm-inline-limit-"));
+  const server = await listenHttp({
+    host: "127.0.0.1", port: 0, path: "/mcp", tenantHeader: "x-context-tenant", inlineLimits: { "mcp__fastmcp-gateway__mem_search": 24576 },
+    maxRequestBytes: 1_000_000, dataDir: join(base, "data"), tenants: { claude: { agent: "claude-code", toolPrefix: "mcp__contextMode__" } },
+  });
+  try {
+    const hook = async (tool_name, text) => {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}/mcp/hooks`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json,text/event-stream", "x-context-tenant": "claude" },
+        body: JSON.stringify({ hook_event_name: "PostToolUse", session_id: "inline-test", cwd: base, tool_name, tool_input: { query: "memory", limit: 8 }, tool_response: [{ type: "text", text }] }),
+      });
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    const rows = Array.from({ length: 8 }, (_, i) => `### row${i}\n${`memory row ${i} text.\n`.repeat(55)}`).join("\n");
+    assert.ok(Buffer.byteLength(rows) > 8000 && Buffer.byteLength(rows) < 24576, "fixture is about 8 KB");
+    assert.equal((await hook("mcp__fastmcp-gateway__mem_search", rows)).stdout, "", "the memory search reply was diverted");
+    assert.match((await hook("mcp__fastmcp-gateway__mem_other", rows)).stdout, /updatedToolOutput/, "another tool of the same size was not diverted");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(base, { recursive: true, force: true });
+  }
+});

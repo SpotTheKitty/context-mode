@@ -25,6 +25,8 @@ export interface HttpConfig {
   /** T230: worker threads that run searches. Default SEARCH_WORKERS; 0 runs a search on the request path (no bound). */
   searchWorkers?: number;
   hookTimeoutMs?: number;
+  /** T1011: tool name (as the host sends it, or its canonical form) -> bytes of its result a hook returns whole. Above it the result is diverted. */
+  inlineLimits?: Record<string, number>;
 }
 /** Test seam: `searchStall` returns how long to block the thread that runs a search before it starts, as a long SQLite statement would. */
 export interface HttpOptions { searchStall?: (args: unknown) => number; }
@@ -62,6 +64,9 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
   if (!(searchTimeoutMs > 0) || !Number.isInteger(searchWorkers) || searchWorkers < 0) throw new Error("invalid contextMode searchTimeoutMs or searchWorkers");
   // Workers load this same file (the flat bundle has no other), so the entry is our own URL.
   if (!(hookTimeoutMs > 0)) throw new Error("invalid contextMode hookTimeoutMs");
+  const inlineLimits = config.inlineLimits;
+  if (inlineLimits !== undefined && (typeof inlineLimits !== "object" || inlineLimits === null || Array.isArray(inlineLimits) ||
+      !Object.values(inlineLimits).every((n) => Number.isSafeInteger(n) && n > 0))) throw new Error("invalid contextMode inlineLimits");
   const entry = fileURLToPath(import.meta.url);
   const pool = searchWorkers > 0 ? new RequestPool<SearchJob, ToolReply>(entry, searchWorkers, "search") : null;
   // Keep hook indexing and SQLite lock waits off the listener. A single worker orders hook writes
@@ -75,7 +80,7 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
       const tenant = incoming.headers[config.tenantHeader.toLowerCase()];
       if (typeof tenant !== "string" || !Object.hasOwn(config.tenants,tenant)) {outgoing.writeHead(403).end("unknown tenant"); return;}
       const agent = config.tenants[tenant]!.agent;
-      await httpScope.run({tenant,database,toolPrefix:config.tenants[tenant]!.toolPrefix},async () => {
+      await httpScope.run({tenant,database,toolPrefix:config.tenants[tenant]!.toolPrefix,inlineLimits},async () => {
         const chunks: Buffer[] = []; let bytes=0;
         for await (const chunk of incoming) {
           bytes += chunk.length;
@@ -92,7 +97,7 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
           if (adapter !== agent && !Object.hasOwn(adapters ?? {},adapter)) {outgoing.writeHead(403).end("unknown hook adapter");return;}
           const toolPrefix = adapters?.[adapter]?.toolPrefix ?? config.tenants[tenant]!.toolPrefix;
           const raw: unknown = wrapped ? input.raw : input;
-          const result = await hooks.run({adapter,raw,env,tenant,database,toolPrefix},hookTimeoutMs);
+          const result = await hooks.run({adapter,raw,env,tenant,database,toolPrefix,inlineLimits},hookTimeoutMs);
           if (result.kind !== "reply") {
             const reason = result.kind === "failed" ? result.message : `context-mode hook exceeded ${hookTimeoutMs} ms (hookTimeoutMs)`;
             console.error(reason);

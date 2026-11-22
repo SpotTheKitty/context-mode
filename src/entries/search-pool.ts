@@ -19,6 +19,8 @@ export interface SearchJob {
 export interface HookJob {
   adapter: AgentId; raw: unknown; env: NodeJS.ProcessEnv;
   tenant: string; database: string; toolPrefix?: string;
+  /** T1011: per-tool inline limit in bytes, from the contextMode table. */
+  inlineLimits?: Readonly<Record<string, number>>;
 }
 type WorkerOutcome<Reply> = { kind: "reply"; reply: Reply } | { kind: "timeout"; started: boolean } | { kind: "failed"; message: string };
 export type WorkerMessage = { id: number; reply: ToolReply | HookOutput } | { id: number; error: string };
