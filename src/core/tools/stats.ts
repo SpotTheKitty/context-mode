@@ -98,13 +98,13 @@ const TOOLS =
   "SELECT tool, COUNT(*) AS calls, COALESCE(SUM(sandbox_bytes), 0) AS produced," +
   ` COALESCE(SUM(returned_bytes), 0) AS returned FROM events WHERE ${CALLS} GROUP BY tool`;
 const SOURCES =
-  "SELECT COUNT(*) AS n, COALESCE(SUM(chunk_count), 0) AS chunks, COALESCE(SUM(bytes_total), 0) AS bytes FROM sources";
+  "SELECT COUNT(*) AS n, COALESCE(SUM(chunk_count), 0) AS chunks, COALESCE(SUM(bytes_total), 0) AS bytes FROM sources WHERE chunk_count >= 0";
 
 // D-STATS-VALUE-1. Hook work: a host row that sent fewer bytes to the chat than it made is an output the
 // PostToolUse hook replaced after it ran; a run.mjs source is a large command the PreToolUse hook sent to the
 // sandbox (ADR-0016 case B), which writes the source and no events row. A redirect saves its bytes past
 // OUTPUT_CAP (the reply the host would have shown is the capped preview).
-const RUNS = "FROM sources WHERE substr(label, 1, ?) = ?";
+const RUNS = "FROM sources WHERE chunk_count >= 0 AND substr(label, 1, ?) = ?";
 const REDIRECTED = `SELECT COUNT(*) AS n, COALESCE(MAX(created_ts), 0) AS last ${RUNS}`;
 const WEEK_RUNS =
   `SELECT created_ts / ${MS_PER_DAY} AS day, COUNT(*) AS calls,` +
@@ -170,15 +170,15 @@ function readFacts(raw: DatabaseSync, sessionId: string): Facts {
   let lastCall = 0;
   let replaced = 0;
 
-  for (const r of raw.prepare(EVENTS_FACTS).all() as Row[]) {
+  for (const r of raw.prepare(EVENTS_FACTS).iterate() as IterableIterator<Row>) {
+    const tool = r.tool === null ? null : String(r.tool);
+    if (tool === "ctx_stats") continue;
     const sid = String(r.session_id);
     const createdAt = Number(r.created_at);
     if (sid === sessionId) {
       if (createdAt < minSpan) minSpan = createdAt;
       if (createdAt > maxSpan) maxSpan = createdAt;
     }
-    const tool = r.tool === null ? null : String(r.tool);
-    if (tool === "ctx_stats") continue;
     const kind = String(r.kind);
     const kc = kinds.get(kind);
     if (kc === undefined) kinds.set(kind, { session: sid === sessionId ? 1 : 0, project: 1 });
@@ -202,7 +202,7 @@ function readFacts(raw: DatabaseSync, sessionId: string): Facts {
     dayCalls.set(day, (dayCalls.get(day) ?? 0) + 1);
     const wk = `${day}:${wayOf(tool)}`;
     dayWayNet.set(wk, (dayWayNet.get(wk) ?? 0) + produced - returned);
-    if (!tool.startsWith("ctx_") && returned < produced) replaced += 1;
+    if (!/^ctx_/i.test(tool) && returned < produced) replaced += 1;
     if (produced > 0) {
       const seq = Number(r.seq);
       const worst = top.length < STATS_TOP_OUTPUTS ? null : top[top.length - 1]!;

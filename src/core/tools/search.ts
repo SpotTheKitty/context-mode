@@ -31,7 +31,8 @@ export const ctxSearchSchema = z.object({
 // Source count for the zero-hit line (PRD §8): the same scope and source filter ftsQuery applies.
 const COUNT_SOURCES = `
 SELECT COUNT(*) AS n FROM sources
-WHERE (:scope <> 'session' OR session_id = :session_id)
+WHERE chunk_count >= 0
+  AND (:scope <> 'session' OR session_id = :session_id)
   AND (:scope <> 'worktree' OR worktree = :worktree)
   AND (:source IS NULL OR label = :source)`;
 
@@ -135,6 +136,7 @@ const JSON_SOURCE_MAX_BYTES = 8 * 1024 * 1024;
 const JSON_SOURCE = `
 SELECT id, bytes_total FROM sources
 WHERE label = :source
+  AND chunk_count >= 0
   AND (:scope <> 'session' OR session_id = :session_id)
   AND (:scope <> 'worktree' OR worktree = :worktree)
 ORDER BY id DESC LIMIT 1`;
@@ -178,7 +180,7 @@ function jsonRowsReply(db: DbHandle, input: CtxSearchInput, scope: SearchScope, 
 // each query is always shown, and the share is spread over the queries (query k may spend k/n of it, so a first
 // query cannot use up the room of the later ones); the hits left out stay behind the `More:` line (nothing is cut).
 const SMALL_SOURCE_SHARE = 0.5;
-const SOURCE_BYTES = "SELECT id, bytes_total FROM sources WHERE id IN (SELECT value FROM json_each(:ids))";
+const SOURCE_BYTES = "SELECT id, bytes_total FROM sources WHERE chunk_count >= 0 AND id IN (SELECT value FROM json_each(:ids))";
 
 function sourceBytes(db: DbHandle, ids: number[]): Map<number, number> {
   const out = new Map<number, number>();

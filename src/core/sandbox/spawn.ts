@@ -6,6 +6,18 @@ import { KILL_GRACE_MS, PIPE_DRAIN_MAX_MS, PIPE_EOF_GRACE_MS } from "../contract
 import { killTree } from "./kill.ts";
 import { findRuntime } from "./runtimes.ts";
 
+export interface ChildProcessTracker {
+  onStart(pid: number): void;
+  onEnd(pid: number): void;
+}
+
+let childTracker: ChildProcessTracker | null = null;
+
+/** Registers a lifecycle tracker for spawned sandbox children (used by HTTP workers so the parent can kill orphans). */
+export function registerChildProcessTracker(tracker: ChildProcessTracker | null): void {
+  childTracker = tracker;
+}
+
 export interface RunOptions {
   cwd: string;
   env: Record<string, string>;
@@ -57,6 +69,8 @@ export function runProcess(argv: string[], o: RunOptions): Promise<RunResult> {
       // Step 7 / D-M2-R3-3: spawn throws (not emits) on bad argv or Windows EINVAL; still never reject.
       return resolve(NOT_STARTED);
     }
+    const trackedPid = child.pid;
+    if (trackedPid !== undefined) childTracker?.onStart(trackedPid);
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let killedBy: "timeout" | "cancel" | null = null;
@@ -93,6 +107,7 @@ export function runProcess(argv: string[], o: RunOptions): Promise<RunResult> {
       clearTimeout(drainTimer);
       clearTimeout(stopTimer);
       o.signal.removeEventListener("abort", onAbort);
+      if (trackedPid !== undefined) childTracker?.onEnd(trackedPid);
       resolve({
         stdout: Buffer.concat(stdoutChunks),
         stderr: Buffer.concat(stderrChunks),

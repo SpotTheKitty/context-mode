@@ -10,6 +10,7 @@ import { DECISION_SOURCE, ECHO_MAX_BYTES, INDEX_WRITE_CHUNK, LABEL_PREVIEW_BYTES
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { Chunk, DbHandle, Hit, ProjectContext, SearchScope, SourceRow, TimelineRow, UnitCandidate } from "../contracts/types.ts";
 import { withWrite } from "./db.ts";
+import { notifyPendingSourceAdd, notifyPendingSourceDone } from "./http-scope.ts";
 import { FTS_TOKENIZE } from "./schema.ts";
 import { buildSnippet, snippetTerms } from "./snippet.ts";
 import { blankTokens } from "./words.ts";
@@ -46,6 +47,7 @@ const PORTER_MATCH = `
          (chunks.rowid IN (SELECT rowid FROM chunks WHERE chunks MATCH :all)) AS full
   FROM chunks JOIN sources s ON s.id = chunks.source_id
   WHERE chunks MATCH :match
+    AND s.chunk_count >= 0
     AND (:scope <> 'session' OR chunks.session_id = :session_id)
     AND (:scope <> 'worktree' OR chunks.worktree = :worktree)
     AND (:source IS NULL OR s.label = :source)
@@ -78,6 +80,7 @@ const TRI_RANK = `
 SELECT t.rowid AS rid, c.source_id AS source_id, c.session_id AS session_id, c.worktree AS worktree, c.ord AS ord
 FROM chunks_tri t JOIN chunks c ON c.rowid = t.rowid JOIN sources s ON s.id = c.source_id
 WHERE chunks_tri MATCH :match
+  AND s.chunk_count >= 0
   AND (:scope <> 'session' OR c.session_id = :session_id)
   AND (:scope <> 'worktree' OR c.worktree = :worktree)
   AND (:source IS NULL OR s.label = :source)
@@ -88,7 +91,8 @@ ORDER BY bm25(chunks_tri, 1.0, ${TITLE_WEIGHT}) ASC, c.source_id DESC, c.ord ASC
 const PAGE_ROWS = `
 SELECT c.rowid AS rid, c.source_id AS source_id, c.ord AS ord, c.body AS body, s.label AS label
 FROM chunks c JOIN sources s ON s.id = c.source_id
-WHERE c.rowid IN (SELECT value FROM json_each(:ids))`;
+WHERE s.chunk_count >= 0
+  AND c.rowid IN (SELECT value FROM json_each(:ids))`;
 
 const INSERT_TRI = "INSERT INTO chunks_tri(rowid, body, title) VALUES (?, ?, ?)";
 // Contentless FTS5 delete: the row's own indexed text goes back in with the 'delete' command.
@@ -98,23 +102,72 @@ const TRI_DELETE = "INSERT INTO chunks_tri(chunks_tri, rowid, body, title) SELEC
 export type SourceDraft = Pick<SourceRow, "sessionId" | "worktree" | "agent" | "kind" | "label" | "createdAt">;
 
 
-// impl/02 §9.1, impl/05 step 4, D-M2-1: one sources INSERT + chunk INSERTs, each withWrite holding at
-// most INDEX_WRITE_CHUNK bytes of chunk text (ADR-0002 decision 2). The source row rides the first
-// batch; its new id is returned.
+// Pending sources use chunk_count = -1 until the final batch publishes their real counts.
+// Readers filter `chunk_count >= 0`; purges delete pending rows too, invalidating in-flight batches.
+const PENDING_CHUNK_COUNT = -1;
+const RESERVATION_LOST_MSG = "Source reservation was invalidated (purged) while indexing";
+
+function assertPendingReservation(raw: DatabaseSync, id: number): void {
+  const row = raw.prepare("SELECT 1 AS ok FROM sources WHERE id = ? AND chunk_count = ?").get(id, PENDING_CHUNK_COUNT);
+  if (row === undefined) throw new Error(RESERVATION_LOST_MSG);
+}
+
+function publishSourceInTx(raw: DatabaseSync, id: number, bytesTotal: number, chunkCount: number): void {
+  const res = raw.prepare("UPDATE sources SET bytes_total = ?, chunk_count = ? WHERE id = ? AND chunk_count = ?")
+    .run(bytesTotal, chunkCount, id, PENDING_CHUNK_COUNT);
+  if (Number(res.changes) !== 1) throw new Error(RESERVATION_LOST_MSG);
+}
+
+function cleanupPendingSource(db: DbHandle, id: number): void {
+  try {
+    withWrite(db, (h) => {
+      const pending = h.raw.prepare("SELECT 1 AS ok FROM sources WHERE id = ? AND chunk_count = ?").get(id, PENDING_CHUNK_COUNT);
+      if (pending === undefined) return;
+      deleteChunkRows(h.raw, { sourceId: id });
+      h.raw.prepare("DELETE FROM sources WHERE id = ? AND chunk_count = ?").run(id, PENDING_CHUNK_COUNT);
+    });
+  } finally {
+    notifyPendingSourceDone(db.path, id);
+  }
+}
+
+// impl/02 §9.1, impl/05 step 4, D-M2-1: reserve a pending source, write chunks in INDEX_WRITE_CHUNK batches
+// verifying the reservation inside every batch, and publish the final counts atomically in the last batch.
 export function ftsInsert(db: DbHandle, src: Omit<SourceRow, "id">, chunks: Chunk[]): number {
+  let total = 0;
+  for (const c of chunks) total += c.bytes;
+  if (chunks.length === 0) {
+    return withWrite(db, (h) => {
+      const row = h.raw.prepare(INSERT_SOURCE).get({
+        session_id: src.sessionId,
+        worktree: src.worktree,
+        agent: src.agent,
+        kind: src.kind,
+        label: src.label,
+        bytes_total: 0,
+        chunk_count: 0,
+        created_ts: src.createdAt,
+        created_at: new Date(src.createdAt).toISOString(),
+      }) as { id: number };
+      return Number(row.id);
+    });
+  }
   const id = reserveSource(db, src, chunks);
-  insertChunks(db, id, src, chunks);
-  return id;
+  try {
+    insertChunks(db, id, src, chunks, { publish: { bytesTotal: total, chunkCount: chunks.length } });
+    notifyPendingSourceDone(db.path, id);
+    return id;
+  } catch (err) {
+    cleanupPendingSource(db, id);
+    throw err;
+  }
 }
 
 /**
- * D-CR3-HANDLE-2: write the source row alone (one small transaction) and return its id, so a caller can name
- * the source by its short id before the chunks are written (the detached F1 path). bytes_total and
- * chunk_count come from `chunks`, as ftsInsert stores them.
+ * D-CR3-HANDLE-2: reserve a pending source row (chunk_count = -1, invisible to readers until published)
+ * and return its id, so a caller can name the source by its short id before the chunks are written.
  */
-export function reserveSource(db: DbHandle, src: SourceDraft, chunks: Chunk[]): number {
-  let total = 0;
-  for (const c of chunks) total += c.bytes;
+export function reserveSource(db: DbHandle, src: SourceDraft, _chunks: Chunk[]): number {
   return withWrite(db, (h) => {
     const row = h.raw.prepare(INSERT_SOURCE).get({
       session_id: src.sessionId,
@@ -122,32 +175,49 @@ export function reserveSource(db: DbHandle, src: SourceDraft, chunks: Chunk[]): 
       agent: src.agent,
       kind: src.kind,
       label: src.label,
-      bytes_total: total,
-      chunk_count: chunks.length,
+      bytes_total: 0,
+      chunk_count: PENDING_CHUNK_COUNT,
       created_ts: src.createdAt,
       created_at: new Date(src.createdAt).toISOString(),
     }) as { id: number };
-    return Number(row.id);
+    const id = Number(row.id);
+    notifyPendingSourceAdd(db.path, id);
+    return id;
   });
 }
 
-// D-R4-RESERVE-1: the detached write of a reserved source. When the chunk or unit write throws, the reserved
-// row and whatever part of it landed are deleted, so no 0-chunk orphan stays in sources; the error is rethrown.
+// D-R4-RESERVE-1: the detached write of a reserved source. Verifies the pending reservation inside every
+// batch and publishes only after the last chunk/unit batch; on any error or purge, cleans up incomplete rows.
 export function finishReserved(db: DbHandle, id: number, src: SourceDraft, chunks: Chunk[], units: ReadonlyArray<{ ord: number; body: string }>): void {
+  let total = 0;
+  for (const c of chunks) total += c.bytes;
+  const publish = { bytesTotal: total, chunkCount: chunks.length };
   try {
-    insertChunks(db, id, src, chunks);
-    insertUnits(db, id, src.sessionId, units);
+    if (units.length === 0) {
+      if (chunks.length === 0) {
+        withWrite(db, (h) => publishSourceInTx(h.raw, id, 0, 0));
+      } else {
+        insertChunks(db, id, src, chunks, { publish });
+      }
+    } else {
+      insertChunks(db, id, src, chunks);
+      insertUnits(db, id, src.sessionId, units, { publish });
+    }
+    notifyPendingSourceDone(db.path, id);
   } catch (err) {
-    withWrite(db, (h) => {
-      deleteChunkRows(h.raw, { sourceId: id });
-      h.raw.prepare("DELETE FROM sources WHERE id = ?").run(id);
-    });
+    cleanupPendingSource(db, id);
     throw err;
   }
 }
 
 /** The chunks of a reserved source, batched at INDEX_WRITE_CHUNK bytes per withWrite (porter + trigram). */
-export function insertChunks(db: DbHandle, id: number, src: SourceDraft, chunks: Chunk[]): void {
+export function insertChunks(
+  db: DbHandle,
+  id: number,
+  src: SourceDraft,
+  chunks: Chunk[],
+  opts?: { publish?: { bytesTotal: number; chunkCount: number } },
+): void {
   const batches: Chunk[][] = [];
   let batch: Chunk[] = [];
   let batchBytes = 0;
@@ -161,14 +231,26 @@ export function insertChunks(db: DbHandle, id: number, src: SourceDraft, chunks:
     batchBytes += c.bytes;
   }
   if (batch.length > 0) batches.push(batch);
-  for (const rows of batches) {
+  if (batches.length === 0) {
+    if (opts?.publish !== undefined) {
+      withWrite(db, (h) => publishSourceInTx(h.raw, id, opts.publish!.bytesTotal, opts.publish!.chunkCount));
+    }
+    return;
+  }
+  for (let i = 0; i < batches.length; i++) {
+    const rows = batches[i]!;
+    const isLast = i === batches.length - 1;
     withWrite(db, (h) => {
+      assertPendingReservation(h.raw, id);
       const ins = h.raw.prepare(INSERT_CHUNK);
       const tri = h.raw.prepare(INSERT_TRI);
       for (const c of rows) {
         const title = c.title ?? "";
         const rid = ins.run(id, src.sessionId, src.worktree, src.agent, c.ord, c.text, title).lastInsertRowid;
         tri.run(rid, c.text, title);
+      }
+      if (isLast && opts?.publish !== undefined) {
+        publishSourceInTx(h.raw, id, opts.publish.bytesTotal, opts.publish.chunkCount);
       }
     });
   }
@@ -434,6 +516,7 @@ WITH p AS (
   WHERE c.source_id IN (
     SELECT id FROM sources
     WHERE label = :source
+      AND chunk_count >= 0
       AND (:scope <> 'session' OR session_id = :session_id)
       AND (:scope <> 'worktree' OR worktree = :worktree))
   ORDER BY (s.session_id = :session_id) DESC, (s.worktree = :worktree) DESC, c.source_id DESC, c.ord ASC
@@ -501,6 +584,7 @@ const TL_SOURCES = `
 WITH s AS (
   SELECT id, label, created_ts FROM sources
   WHERE created_ts > :after${TL_SCOPE}
+    AND chunk_count >= 0
     AND (:source IS NULL OR label = :source)
     AND label <> :reserved
 )
@@ -517,7 +601,7 @@ SELECT source_id, body FROM chunks WHERE ord = 0 AND source_id IN (SELECT value 
 // Rows remain past the page when either DB source has a row newer than the page's last timestamp.
 const TL_MORE = `
 SELECT EXISTS(SELECT 1 FROM events WHERE created_at > :after${TL_SCOPE} AND (:source IS NULL OR kind = :source))
-    OR EXISTS(SELECT 1 FROM sources WHERE created_ts > :after${TL_SCOPE} AND (:source IS NULL OR label = :source)
+    OR EXISTS(SELECT 1 FROM sources WHERE created_ts > :after${TL_SCOPE} AND chunk_count >= 0 AND (:source IS NULL OR label = :source)
                  AND label <> :reserved) AS more`;
 
 interface EventTlRow { seq: number; kind: string; key: string | null; path: string | null; body: string | null; created_at: number; }
@@ -669,8 +753,11 @@ export function pathLabel(p: string): string {
   return p.includes("\\") ? p.split("\\").join("/") : p;
 }
 
-function labelStored(db: DbHandle, label: string): boolean {
-  return stmt(db.raw, "SELECT 1 AS x FROM sources WHERE label = ? LIMIT 1").get(label) !== undefined;
+function labelStored(db: DbHandle, label: string, includePending = false): boolean {
+  const sql = includePending
+    ? "SELECT 1 AS x FROM sources WHERE label = ? LIMIT 1"
+    : "SELECT 1 AS x FROM sources WHERE label = ? AND chunk_count >= 0 LIMIT 1";
+  return stmt(db.raw, sql).get(label) !== undefined;
 }
 
 /**
@@ -678,10 +765,10 @@ function labelStored(db: DbHandle, label: string): boolean {
  * it, else its forward-slash form (a backslash path from a Windows agent), else the argument as given.
  * ctx_purge uses this alone; ctx_search adds the id and "#" suffix forms in resolveSourceLabel.
  */
-export function storedLabel(db: DbHandle, source: string): string {
-  if (labelStored(db, source)) return source;
+export function storedLabel(db: DbHandle, source: string, includePending = false): string {
+  if (labelStored(db, source, includePending)) return source;
   const canon = pathLabel(source);
-  return canon !== source && labelStored(db, canon) ? canon : source;
+  return canon !== source && labelStored(db, canon, includePending) ? canon : source;
 }
 
 /** D-LABEL-HANDLE-1: what a `source` argument named: the label, the newest row id with it, and the other source
@@ -693,13 +780,19 @@ export interface SourcePick {
   other: { id: number; label: string } | null;
 }
 
-function newestId(db: DbHandle, label: string): number | null {
-  const row = stmt(db.raw, "SELECT id FROM sources WHERE label = ? ORDER BY id DESC LIMIT 1").get(label) as { id: number } | undefined;
+function newestId(db: DbHandle, label: string, includePending = false): number | null {
+  const sql = includePending
+    ? "SELECT id FROM sources WHERE label = ? ORDER BY id DESC LIMIT 1"
+    : "SELECT id FROM sources WHERE label = ? AND chunk_count >= 0 ORDER BY id DESC LIMIT 1";
+  const row = stmt(db.raw, sql).get(label) as { id: number } | undefined;
   return row === undefined ? null : Number(row.id);
 }
 
-function labelOfId(db: DbHandle, id: number): string | null {
-  const row = stmt(db.raw, "SELECT label FROM sources WHERE id = ?").get(id) as { label: string } | undefined;
+function labelOfId(db: DbHandle, id: number, includePending = false): string | null {
+  const sql = includePending
+    ? "SELECT label FROM sources WHERE id = ?"
+    : "SELECT label FROM sources WHERE id = ? AND chunk_count >= 0";
+  const row = stmt(db.raw, sql).get(id) as { label: string } | undefined;
   return row === undefined ? null : row.label;
 }
 
@@ -707,21 +800,21 @@ function labelOfId(db: DbHandle, id: number): string | null {
 // a stored label (either slash form, D-PATH-LABEL-1) - what the user typed wins -, then the short id of a stored
 // row, then (with `suffix`) a label without its "#<call id>" suffix (the newest such source). No match -> the
 // argument as given, id null. ctx_purge passes suffix false: a delete names one label exactly.
-export function pickSource(db: DbHandle, source: string, suffix = true): SourcePick {
-  const named = storedLabel(db, source);
+export function pickSource(db: DbHandle, source: string, suffix = true, includePending = false): SourcePick {
+  const named = storedLabel(db, source, includePending);
   const id = parseSourceHandle(source);
-  const own = newestId(db, named);
+  const own = newestId(db, named, includePending);
   if (own !== null) {
-    const otherLabel = id === null || id === own ? null : labelOfId(db, id);
+    const otherLabel = id === null || id === own ? null : labelOfId(db, id, includePending);
     return { label: named, id: own, via: "label", other: otherLabel === null || otherLabel === named ? null : { id: id as number, label: otherLabel } };
   }
   if (id !== null) {
-    const label = labelOfId(db, id);
+    const label = labelOfId(db, id, includePending);
     if (label !== null) return { label, id, via: "handle", other: null };
   }
   if (suffix) {
     const prefix = named + LABEL_SUFFIX_SEP;
-    const rows = stmt(db.raw, "SELECT id, label FROM sources WHERE substr(label, 1, ?) = ? ORDER BY id DESC").all(prefix.length, prefix) as Array<{ id: number; label: string }>;
+    const rows = stmt(db.raw, "SELECT id, label FROM sources WHERE chunk_count >= 0 AND substr(label, 1, ?) = ? ORDER BY id DESC").all(prefix.length, prefix) as Array<{ id: number; label: string }>;
     for (const r of rows) {
       if (r.label.lastIndexOf(LABEL_SUFFIX_SEP) === named.length) return { label: r.label, id: Number(r.id), via: "suffix", other: null };
     }
@@ -804,20 +897,32 @@ export function sourceArg(label: string, id: number | null): string {
 
 /** D-LABEL-HANDLE-2: one stored source row by id, for the source card. */
 export function sourceCardRow(db: DbHandle, id: number): { label: string; bytes: number; chunks: number; kind: string } | null {
-  const row = stmt(db.raw, "SELECT label, bytes_total, chunk_count, kind FROM sources WHERE id = ?").get(id) as { label: string; bytes_total: number; chunk_count: number; kind: string } | undefined;
+  const row = stmt(db.raw, "SELECT label, bytes_total, chunk_count, kind FROM sources WHERE id = ? AND chunk_count >= 0").get(id) as { label: string; bytes_total: number; chunk_count: number; kind: string } | undefined;
   return row === undefined ? null : { label: row.label, bytes: Number(row.bytes_total), chunks: Number(row.chunk_count), kind: row.kind };
 }
 
 /** D-CR3-RESUME-1: this session's stored sources, newest first (id, label, bytes). */
 export function listSessionSources(db: DbHandle, sessionId: string, limit: number): Array<{ id: number; label: string; bytes: number }> {
-  const rows = stmt(db.raw, "SELECT id, label, bytes_total FROM sources WHERE session_id = ? ORDER BY id DESC LIMIT ?").all(sessionId, limit) as Array<{ id: number; label: string; bytes_total: number }>;
+  const rows = stmt(db.raw, "SELECT id, label, bytes_total FROM sources WHERE session_id = ? AND chunk_count >= 0 ORDER BY id DESC LIMIT ?").all(sessionId, limit) as Array<{ id: number; label: string; bytes_total: number }>;
   return rows.map((r) => ({ id: Number(r.id), label: r.label, bytes: Number(r.bytes_total) }));
 }
 
 // ---------- r3-ledger line units ----------
 
 /** Store one output's line units, batched like ftsInsert (at most INDEX_WRITE_CHUNK bytes per withWrite). */
-export function insertUnits(db: DbHandle, sourceId: number, sessionId: string, units: ReadonlyArray<{ ord: number; body: string }>): void {
+export function insertUnits(
+  db: DbHandle,
+  sourceId: number,
+  sessionId: string,
+  units: ReadonlyArray<{ ord: number; body: string }>,
+  opts?: { publish?: { bytesTotal: number; chunkCount: number } },
+): void {
+  if (units.length === 0) {
+    if (opts?.publish !== undefined) {
+      withWrite(db, (h) => publishSourceInTx(h.raw, sourceId, opts.publish!.bytesTotal, opts.publish!.chunkCount));
+    }
+    return;
+  }
   let start = 0;
   while (start < units.length) {
     let end = start;
@@ -827,11 +932,20 @@ export function insertUnits(db: DbHandle, sourceId: number, sessionId: string, u
       end++;
     }
     const from = start;
+    const isLast = end >= units.length;
     withWrite(db, (h) => {
+      if (opts?.publish !== undefined) {
+        assertPendingReservation(h.raw, sourceId);
+      } else if (h.raw.prepare("SELECT 1 AS ok FROM sources WHERE id = ?").get(sourceId) === undefined) {
+        throw new Error(RESERVATION_LOST_MSG);
+      }
       const ins = h.raw.prepare("INSERT INTO line_units(body, source_id, session_id, ord) VALUES (?, ?, ?, ?)");
       for (let i = from; i < end; i++) {
         const u = units[i] as { ord: number; body: string };
         ins.run(u.body, sourceId, sessionId, u.ord);
+      }
+      if (isLast && opts?.publish !== undefined) {
+        publishSourceInTx(h.raw, sourceId, opts.publish.bytesTotal, opts.publish.chunkCount);
       }
     });
     start = end;
@@ -870,7 +984,7 @@ export function queryUnits(db: DbHandle, sessionId: string, q: string, limit: nu
   const rows = db.raw.prepare(
     "SELECT u.source_id AS source_id, u.ord AS ord, u.body AS body, -bm25(line_units) AS score, s.label AS label " +
     "FROM line_units u JOIN sources s ON s.id = u.source_id " +
-    "WHERE line_units MATCH ? AND u.session_id = ? ORDER BY bm25(line_units) LIMIT ?",
+    "WHERE line_units MATCH ? AND u.session_id = ? AND s.chunk_count >= 0 ORDER BY bm25(line_units) LIMIT ?",
   ).all(match, sessionId, limit) as Array<{ source_id: number; ord: number; body: string; score: number; label: string }>;
   return rows.map((r) => ({ sourceId: Number(r.source_id), ord: Number(r.ord), label: r.label, body: r.body, score: r.score }));
 }

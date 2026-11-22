@@ -12,10 +12,13 @@ import { resolveProject } from "../core/project/resolve.ts";
 import { appendEvent, ownCallRow } from "../core/journal/append.ts";
 import { closeDb, openDb } from "../core/store/db.ts";
 import { httpScope, settleHttpScope, type ExcerptBand } from "../core/store/http-scope.ts";
+import { buildStatsIndex } from "../core/store/tenant-store.ts";
 import type { AgentId, HookOutput, ToolContext, ToolReply } from "../core/contracts/types.ts";
 import { DB_FILE_NAME, EXEC_TIMEOUT_MS, HOOK_TIMEOUT_MS } from "../core/contracts/constants.ts";
-import { SEARCH_WORKER_ROLE, RequestPool, WriteCoordinator, type HookJob, type ToolJob } from "./search-pool.ts";
+import { MAX_POOL_WORKERS, SEARCH_WORKER_ROLE, RequestPool, WriteCoordinator, type HookJob, type ToolJob } from "./search-pool.ts";
 import { serveSearchWorker, stallSync } from "./search-worker.ts";
+
+export { buildStatsIndex, MAX_POOL_WORKERS };
 
 export interface HttpConfig {
   host: string; port: number; path: string; tenantHeader: string; dataDir: string;
@@ -29,7 +32,7 @@ export interface HttpConfig {
   toolTimeoutMs?: number;
   /** T230: budget for one ctx_search, queue wait included. Default SEARCH_TIMEOUT_MS. */
   searchTimeoutMs?: number;
-  /** T230: worker threads that run searches. 0 runs a search on the request path (control/no bound). */
+  /** T230: worker threads that run searches. 0 runs a search on the request path (library control test only; rejected in endpoint tables). */
   searchWorkers?: number;
   /** Data setting: worker threads that run /mcp/hooks. Defaults dynamically from CPU count (>= 2). */
   hookWorkers?: number;
@@ -56,6 +59,29 @@ export function defaultWorkerCounts(cpus: number = availableParallelism()): { to
     searchWorkers: Math.max(2, Math.min(4, Math.ceil(cores / 4))),
     hookWorkers: Math.max(2, Math.min(4, Math.ceil(cores / 4))),
   };
+}
+
+/** Parses a workstation endpoint table JSON object for CLI startup and forbids the zero-worker control mode in production tables. */
+export function configFromEndpointTable(table: { contextMode?: HttpConfig; sessionLog?: { sessionRoot?: string } }): HttpConfig {
+  if (!table || typeof table !== "object" || !table.contextMode || typeof table.contextMode !== "object") {
+    throw new Error("incomplete contextMode table");
+  }
+  const config = {
+    ...table.contextMode,
+    sessionRoot: table.contextMode.sessionRoot ?? table.sessionLog?.sessionRoot,
+  } as HttpConfig;
+  if (config.searchWorkers === 0) {
+    throw new Error("invalid contextMode searchWorkers: 0 is not allowed in endpoint table config");
+  }
+  return config;
+}
+
+function validWorkerCount(value: number, min: number): boolean {
+  return Number.isSafeInteger(value) && value >= min && value <= MAX_POOL_WORKERS;
+}
+
+function validTimeout(value: number): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
 function timeoutReply(tool: string, ms: number, started: boolean, setting: string): ToolReply {
@@ -91,9 +117,15 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
   const searchWorkers = config.searchWorkers ?? defaults.searchWorkers;
   const hookWorkers = config.hookWorkers ?? defaults.hookWorkers;
   const hookTimeoutMs = config.hookTimeoutMs ?? HOOK_TIMEOUT_MS;
-  if (!Number.isInteger(toolWorkers) || toolWorkers < 1 || !(toolTimeoutMs > 0)) throw new Error("invalid contextMode toolWorkers or toolTimeoutMs");
-  if (!(searchTimeoutMs > 0) || !Number.isInteger(searchWorkers) || searchWorkers < 0) throw new Error("invalid contextMode searchTimeoutMs or searchWorkers");
-  if (!Number.isInteger(hookWorkers) || hookWorkers < 1 || !(hookTimeoutMs > 0)) throw new Error("invalid contextMode hookWorkers or hookTimeoutMs");
+  if (!validWorkerCount(toolWorkers, 1) || !validTimeout(toolTimeoutMs)) {
+    throw new Error(`invalid contextMode toolWorkers (expected integer 1..${MAX_POOL_WORKERS}) or toolTimeoutMs`);
+  }
+  if (!validTimeout(searchTimeoutMs) || !validWorkerCount(searchWorkers, 0)) {
+    throw new Error(`invalid contextMode searchTimeoutMs or searchWorkers (expected integer 0..${MAX_POOL_WORKERS})`);
+  }
+  if (!validWorkerCount(hookWorkers, 1) || !validTimeout(hookTimeoutMs)) {
+    throw new Error(`invalid contextMode hookWorkers (expected integer 1..${MAX_POOL_WORKERS}) or hookTimeoutMs`);
+  }
   const inlineLimits = config.inlineLimits;
   if (inlineLimits !== undefined && (typeof inlineLimits !== "object" || inlineLimits === null || Array.isArray(inlineLimits) ||
       !Object.values(inlineLimits).every((n) => Number.isSafeInteger(n) && n > 0))) throw new Error("invalid contextMode inlineLimits");
@@ -111,8 +143,6 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
   const toolPool = new RequestPool<ToolJob, ToolReply>(entry, toolWorkers, "tools", poolOpts);
   const searchPool = searchWorkers > 0 ? new RequestPool<ToolJob, ToolReply>(entry, searchWorkers, "search", poolOpts) : null;
   const hooks = new RequestPool<HookJob, HookOutput>(entry, hookWorkers, "hook", poolOpts);
-  // Pre-warm hook workers asynchronously so the very first hook check never pays cold worker-load latency.
-  hooks.warm(Math.min(2, hookWorkers));
 
   // Machine-wide install/repair tools are deliberately unavailable on a shared tenant
   // connection. Pre-compile JSON schemas once rather than per request.
@@ -217,7 +247,7 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
                 // ctx_stats is read-only and excluded from all stats counts; journaling its report on HTTP probes bloats events and forces a WAL write + checkpoint per poll.
                 journal: tool.name !== "ctx_stats",
                 stallMs,
-              }, budgetMs);
+              }, budgetMs, req.mcpReq.signal);
               if (out.kind === "failed") throw new Error(out.message);
               reply = out.kind === "timeout" ? timeoutReply(tool.name, budgetMs, out.started, setting) : out.reply;
             }
@@ -237,8 +267,16 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
       } finally {await server.close();}
     } catch (e) {console.error("context-mode HTTP request failed", e); if (!outgoing.headersSent) outgoing.writeHead(500); outgoing.end("request failed");}
   });
-  await new Promise<void>((resolve,reject)=>{host.once("error",reject);host.listen(config.port,config.host,()=>{host.off("error",reject);resolve();});});
+  try {
+    await new Promise<void>((resolve,reject)=>{host.once("error",reject);host.listen(config.port,config.host,()=>{host.off("error",reject);resolve();});});
+  } catch (err) {
+    coordinator.close();
+    await Promise.allSettled([toolPool.close(), searchPool?.close(), hooks.close()]);
+    throw err;
+  }
   host.once("close",() => {coordinator.close(); void toolPool.close(); void searchPool?.close(); void hooks.close();});
+  // Pre-warm hook workers only after the bind succeeds so a failed bind never leaks workers.
+  hooks.warm(Math.min(2, hookWorkers));
   return host;
 }
 
@@ -247,7 +285,13 @@ if (!isMainThread && (workerData as {role?: string} | null)?.role === SEARCH_WOR
   serveSearchWorker();
 } else if (isMainThread && process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const table = JSON.parse(readFileSync(process.argv[2]!,"utf8"));
-  const config = {...table.contextMode, sessionRoot:table.contextMode.sessionRoot ?? table.sessionLog?.sessionRoot} as HttpConfig;
+  const config = configFromEndpointTable(table);
+  if (process.argv.includes("--build-stats-index")) {
+    const database = join(config.dataDir, DB_FILE_NAME);
+    const result = buildStatsIndex(database);
+    console.log(JSON.stringify({ event: "stats_index_upgrade", database, ...result }));
+    process.exit(0);
+  }
   const host = await listenHttp(config);
   console.error(JSON.stringify({event:"listening",pid:process.pid,parentPid:process.ppid,address:host.address(),instance:randomUUID()}));
 }

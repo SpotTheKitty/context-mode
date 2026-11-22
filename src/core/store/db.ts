@@ -177,7 +177,7 @@ export async function openDb(project: ProjectContext, opts?: { readOnly?: boolea
 // ADR-0002 decision 2: every write transaction starts BEGIN IMMEDIATE. No retry loop on top of
 // DB_TIMEOUT_MS; a SQLITE_BUSY from BEGIN propagates unchanged (impl/02 §6.2).
 export function withWrite<T>(db: DbHandle, fn: (db: DbHandle) => T): T {
-  return withHttpWriteLock(db.path, () => {
+  return withHttpWriteLock(() => {
     db.raw.exec("BEGIN IMMEDIATE");
     try {
       const result = fn(db);

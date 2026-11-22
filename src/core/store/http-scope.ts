@@ -6,34 +6,52 @@ export interface HttpScope { tenant: string; database: string; toolPrefix?: stri
 export const httpScope = new AsyncLocalStorage<HttpScope>();
 
 interface WriteLockAdapter {
-  acquire(database: string): void;
-  release(database: string): void;
+  acquire(): void;
+  release(): void;
+}
+
+export interface PendingSourceTracker {
+  add(database: string, sourceId: number): void;
+  done(database: string, sourceId: number): void;
 }
 
 let writeLock: WriteLockAdapter | null = null;
-const lockDepth = new Map<string, number>();
+let lockDepth = 0;
+let pendingTracker: PendingSourceTracker | null = null;
 
-/** Registers the per-database single-writer lock used by HTTP worker threads. */
+/** Registers the single-database write mutex used by HTTP worker threads. */
 export function registerHttpWriteLock(adapter: WriteLockAdapter | null): void {
   writeLock = adapter;
-  lockDepth.clear();
+  lockDepth = 0;
 }
 
-/** Runs `fn` while holding the HTTP process-wide write lease for `database`. No-op outside an HTTP worker. */
-export function withHttpWriteLock<T>(database: string, fn: () => T): T {
+/** Registers the pending-source reservation tracker used by HTTP worker threads. */
+export function registerPendingSourceTracker(tracker: PendingSourceTracker | null): void {
+  pendingTracker = tracker;
+}
+
+/** Records a newly reserved pending source on the parent coordinator so worker exit can clean it up. */
+export function notifyPendingSourceAdd(database: string, sourceId: number): void {
+  if (pendingTracker !== null && httpScope.getStore() !== undefined) pendingTracker.add(database, sourceId);
+}
+
+/** Clears a pending source reservation after it has been published or rolled back. */
+export function notifyPendingSourceDone(database: string, sourceId: number): void {
+  if (pendingTracker !== null && httpScope.getStore() !== undefined) pendingTracker.done(database, sourceId);
+}
+
+/** Runs `fn` while holding the HTTP process-wide write mutex. No-op outside an HTTP worker. */
+export function withHttpWriteLock<T>(fn: () => T): T {
   if (writeLock === null || httpScope.getStore() === undefined) return fn();
-  const depth = lockDepth.get(database) ?? 0;
-  if (depth === 0) writeLock.acquire(database);
-  lockDepth.set(database, depth + 1);
+  if (lockDepth === 0) writeLock.acquire();
+  lockDepth += 1;
   try {
     return fn();
   } finally {
-    const next = (lockDepth.get(database) ?? 1) - 1;
-    if (next <= 0) {
-      lockDepth.delete(database);
-      writeLock.release(database);
-    } else {
-      lockDepth.set(database, next);
+    lockDepth -= 1;
+    if (lockDepth <= 0) {
+      lockDepth = 0;
+      writeLock.release();
     }
   }
 }

@@ -52,7 +52,8 @@ function purgeScope(db: DbHandle, scope: PurgeScope, input: CtxPurgeInput): numb
   if (scope === "source") {
     // D-PATH-LABEL-1: a path label is named by either slash form. D-LABEL-HANDLE-1/2: a stored label wins, then
     // a source's handle (so a long label is purged by its short handle); no "#" suffix match for a delete.
-    const label = pickSource(db, input.source as string, false).label;
+    // Include pending (in-flight) reservations so purging a label invalidates concurrent indexing batches.
+    const label = pickSource(db, input.source as string, false, true).label;
     return deleteChunkRows(raw, { label }) + changes(raw, "DELETE FROM sources WHERE label = ?", label);
   }
   const chunks = deleteChunkRows(raw, "all");

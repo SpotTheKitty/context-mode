@@ -8,7 +8,7 @@ import { httpScope, withHttpWriteLock } from "./http-scope.ts";
 
 const TABLES = ["events", "sources", "meta", "chunks", "chunks_tri", "line_units", "legacy_records"] as const;
 const FTS = new Set(["chunks", "chunks_tri", "line_units"]);
-const EVENTS_STATS_INDEX = "idx_events_tenant_stats";
+export const EVENTS_STATS_INDEX = "idx_events_tenant_stats";
 const CREATE_EVENTS_STATS_INDEX =
   `CREATE INDEX IF NOT EXISTS ${EVENTS_STATS_INDEX} ON events(tenant,project_key,kind,tool,session_id,agent,sandbox_bytes,returned_bytes,created_at,seq)`;
 const quote = (s: string): string => "'" + s.replaceAll("'", "''") + "'";
@@ -20,7 +20,6 @@ export function migrateTenantStore(raw: DatabaseSync, tenant: string, project: s
   applyMigrations(raw, version);
   raw.exec("CREATE TABLE IF NOT EXISTS legacy_records (tenant TEXT NOT NULL, project_key TEXT NOT NULL, origin TEXT NOT NULL, table_name TEXT NOT NULL, record_key TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(tenant,project_key,origin,table_name,record_key))");
   if ((raw.prepare("PRAGMA table_info(sources)").all() as {name:string}[]).some(c => c.name === "tenant")) {
-    raw.exec(CREATE_EVENTS_STATS_INDEX);
     return;
   }
   raw.exec("BEGIN IMMEDIATE");
@@ -98,6 +97,71 @@ function isWalMode(raw: DatabaseSync): boolean {
   return row?.journal_mode?.toLowerCase() === "wal";
 }
 
+/** Explicit out-of-band upgrade step to build `idx_events_tenant_stats` once without stalling request opens.
+ *  In WAL mode concurrent readers continue using the previous plan while the index builds. */
+export function buildStatsIndex(database: string): { status: "created" | "exists" | "missing"; durationMs: number } {
+  const { existsSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
+  if (!existsSync(database)) return { status: "missing", durationMs: 0 };
+  const sqlite = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+  const raw = new sqlite.DatabaseSync(database, { timeout: 60000 });
+  try {
+    if (!isTenantMigrated(raw)) throw new Error("Database is not yet tenant-migrated: " + database);
+    if (hasStatsIndex(raw)) {
+      console.error(JSON.stringify({ event: "stats_index_build_skipped", index: EVENTS_STATS_INDEX, database, reason: "already_exists" }));
+      return { status: "exists", durationMs: 0 };
+    }
+    console.error(JSON.stringify({ event: "stats_index_build_start", index: EVENTS_STATS_INDEX, database }));
+    const t0 = performance.now();
+    raw.exec(CREATE_EVENTS_STATS_INDEX);
+    const durationMs = Math.round(performance.now() - t0);
+    console.error(JSON.stringify({ event: "stats_index_build_end", index: EVENTS_STATS_INDEX, database, durationMs }));
+    try { raw.exec("PRAGMA wal_checkpoint(PASSIVE)"); } catch { /* best-effort */ }
+    return { status: "created", durationMs };
+  } finally {
+    raw.close();
+  }
+}
+
+/** Removes abandoned pending sources (chunk_count = -1) and any partial chunks/units left by a crashed worker. */
+export function cleanupAbandonedSources(database: string, sourceIds: readonly number[]): number {
+  if (sourceIds.length === 0) return 0;
+  const { existsSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
+  if (!existsSync(database)) return 0;
+  const sqlite = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+  const raw = new sqlite.DatabaseSync(database, { timeout: 5000 });
+  try {
+    return withHttpWriteLock(() => {
+      raw.exec("BEGIN IMMEDIATE");
+      try {
+        let removed = 0;
+        const check = raw.prepare("SELECT 1 AS ok FROM main.sources WHERE id = ? AND chunk_count = -1");
+        const delTri = raw.prepare(
+          "INSERT INTO main.chunks_tri(chunks_tri, rowid, body, title, tenant, project_key) " +
+          "SELECT 'delete', rowid, body, title, tenant, project_key FROM main.chunks WHERE source_id = ?",
+        );
+        const delUnits = raw.prepare("DELETE FROM main.line_units WHERE source_id = ?");
+        const delChunks = raw.prepare("DELETE FROM main.chunks WHERE source_id = ?");
+        const delSource = raw.prepare("DELETE FROM main.sources WHERE id = ? AND chunk_count = -1");
+        for (const id of sourceIds) {
+          if (check.get(id) === undefined) continue;
+          delTri.run(id);
+          delUnits.run(id);
+          delChunks.run(id);
+          removed += Number(delSource.run(id).changes);
+        }
+        raw.exec("COMMIT");
+        return removed;
+      } catch (err) {
+        if (raw.isTransaction) raw.exec("ROLLBACK");
+        throw err;
+      }
+    });
+  } finally {
+    try { raw.exec("PRAGMA wal_checkpoint(PASSIVE)"); } catch { /* best-effort */ }
+    raw.close();
+  }
+}
+
 export function openTenantDb(project: ProjectContext, readOnly = false): DbHandle {
   const scope = httpScope.getStore();
   if (!scope) throw new Error("missing HTTP tenant scope");
@@ -109,12 +173,11 @@ export function openTenantDb(project: ProjectContext, readOnly = false): DbHandl
   scope.closers.add(() => raw.close());
   try {
     // Avoid issuing DDL or WAL mode switches on already-migrated stores so concurrent WAL readers never block on write locks.
+    // Never build idx_events_tenant_stats in the request path; when missing, queries run on the existing plan until buildStatsIndex runs.
     const migrated = isTenantMigrated(raw);
-    const needsStatsIndex = !hasStatsIndex(raw);
-    if (!migrated || needsStatsIndex || (!readOnly && !isWalMode(raw))) {
-      withHttpWriteLock(scope.database, () => {
+    if (!migrated || (!readOnly && !isWalMode(raw))) {
+      withHttpWriteLock(() => {
         if (!isTenantMigrated(raw)) migrateTenantStore(raw, scope.tenant, project.projectKey);
-        else if (!hasStatsIndex(raw)) raw.exec(CREATE_EVENTS_STATS_INDEX);
         if (!isWalMode(raw)) raw.exec("PRAGMA journal_mode = WAL");
       });
     }

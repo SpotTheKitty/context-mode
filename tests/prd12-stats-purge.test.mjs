@@ -231,7 +231,8 @@ describe("PRD-v2 sections 8 and 12: stats and purge (concurrent)", { concurrency
       assert.equal(out.text.split("\n")[0], STATS_SUMMARY(97.7, 97.8));
       const rep = report(out.text);
       // D-STATS-FIX-1 (7): one line right under the scope line says it all, with one verb ("kept out").
-      assert.ok(rep.includes("This session · 9 calls · 10m active\n  544.2 KB became 12.1 KB: 532.0 KB kept out (97.8%)\n"), rep);
+      // Session s1 work spans seq 1..10 (9m); seq 11 is a ctx_stats row, excluded from active span like all other stats metrics.
+      assert.ok(rep.includes("This session · 9 calls · 9m active\n  544.2 KB became 12.1 KB: 532.0 KB kept out (97.8%)\n"), rep);
       assert.ok(rep.includes("  Without context-mode |" + "█".repeat(40) + "|   544.2 KB"), rep);
       assert.ok(rep.includes("  With context-mode    |█" + "░".repeat(39) + "|    12.1 KB"), rep);
       assert.ok(!rep.includes(" saved"), "one verb for the result: kept out");
