@@ -2,11 +2,15 @@
 import type { DatabaseSync } from "node:sqlite";
 import { dirname } from "node:path";
 import type { DbHandle, ProjectContext } from "../contracts/types.ts";
+import { SCHEMA_VERSION } from "../contracts/constants.ts";
 import { applyMigrations } from "./schema.ts";
-import { httpScope } from "./http-scope.ts";
+import { httpScope, withHttpWriteLock } from "./http-scope.ts";
 
 const TABLES = ["events", "sources", "meta", "chunks", "chunks_tri", "line_units", "legacy_records"] as const;
 const FTS = new Set(["chunks", "chunks_tri", "line_units"]);
+const EVENTS_STATS_INDEX = "idx_events_tenant_stats";
+const CREATE_EVENTS_STATS_INDEX =
+  `CREATE INDEX IF NOT EXISTS ${EVENTS_STATS_INDEX} ON events(tenant,project_key,kind,tool,session_id,agent,sandbox_bytes,returned_bytes,created_at,seq)`;
 const quote = (s: string): string => "'" + s.replaceAll("'", "''") + "'";
 
 /** Upgrade a v6 database once, tagging every existing row with caller-supplied identity.
@@ -15,7 +19,10 @@ export function migrateTenantStore(raw: DatabaseSync, tenant: string, project: s
   const version = Number((raw.prepare("PRAGMA user_version").get() as {user_version:number}).user_version);
   applyMigrations(raw, version);
   raw.exec("CREATE TABLE IF NOT EXISTS legacy_records (tenant TEXT NOT NULL, project_key TEXT NOT NULL, origin TEXT NOT NULL, table_name TEXT NOT NULL, record_key TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(tenant,project_key,origin,table_name,record_key))");
-  if ((raw.prepare("PRAGMA table_info(sources)").all() as {name:string}[]).some(c => c.name === "tenant")) return;
+  if ((raw.prepare("PRAGMA table_info(sources)").all() as {name:string}[]).some(c => c.name === "tenant")) {
+    raw.exec(CREATE_EVENTS_STATS_INDEX);
+    return;
+  }
   raw.exec("BEGIN IMMEDIATE");
   try {
     for (const table of ["events", "sources"]) {
@@ -36,7 +43,7 @@ export function migrateTenantStore(raw: DatabaseSync, tenant: string, project: s
       raw.exec(`DROP TABLE ${table}; ALTER TABLE ${table}_tenant RENAME TO ${table}`);
     }
     raw.exec("DROP TABLE chunks_tri; DROP TABLE chunks_vocab; CREATE VIRTUAL TABLE chunks_tri USING fts5(body,title,tenant UNINDEXED,project_key UNINDEXED,tokenize='trigram',content=''); INSERT INTO chunks_tri(rowid,body,title,tenant,project_key) SELECT rowid,body,title,tenant,project_key FROM chunks; CREATE VIRTUAL TABLE chunks_vocab USING fts5vocab(chunks,'row'); CREATE VIRTUAL TABLE chunks_vocab_instances USING fts5vocab(chunks,'instance')");
-    raw.exec("CREATE INDEX idx_sources_tenant_project ON sources(tenant,project_key); CREATE INDEX idx_events_tenant_project ON events(tenant,project_key)");
+    raw.exec(`CREATE INDEX idx_sources_tenant_project ON sources(tenant,project_key); CREATE INDEX idx_events_tenant_project ON events(tenant,project_key); ${CREATE_EVENTS_STATS_INDEX}`);
     raw.exec("COMMIT");
   } catch (e) { if (raw.isTransaction) raw.exec("ROLLBACK"); throw e; }
 }
@@ -75,6 +82,22 @@ export function scopedWrite(sql: string, tenant: string, project: string): strin
   return scoped + (parts.length > 1 ? " RETURNING " + parts[1] : "");
 }
 
+function isTenantMigrated(raw: DatabaseSync): boolean {
+  const version = Number((raw.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+  if (version !== SCHEMA_VERSION) return false;
+  if (raw.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_records'").get() === undefined) return false;
+  return (raw.prepare("PRAGMA table_info(sources)").all() as { name: string }[]).some((c) => c.name === "tenant");
+}
+
+function hasStatsIndex(raw: DatabaseSync): boolean {
+  return raw.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(EVENTS_STATS_INDEX) !== undefined;
+}
+
+function isWalMode(raw: DatabaseSync): boolean {
+  const row = raw.prepare("PRAGMA journal_mode").get() as { journal_mode?: string } | undefined;
+  return row?.journal_mode?.toLowerCase() === "wal";
+}
+
 export function openTenantDb(project: ProjectContext, readOnly = false): DbHandle {
   const scope = httpScope.getStore();
   if (!scope) throw new Error("missing HTTP tenant scope");
@@ -85,7 +108,16 @@ export function openTenantDb(project: ProjectContext, readOnly = false): DbHandl
   scope.closers ??= new Set();
   scope.closers.add(() => raw.close());
   try {
-    migrateTenantStore(raw, scope.tenant, project.projectKey);
+    // Avoid issuing DDL or WAL mode switches on already-migrated stores so concurrent WAL readers never block on write locks.
+    const migrated = isTenantMigrated(raw);
+    const needsStatsIndex = !hasStatsIndex(raw);
+    if (!migrated || needsStatsIndex || (!readOnly && !isWalMode(raw))) {
+      withHttpWriteLock(scope.database, () => {
+        if (!isTenantMigrated(raw)) migrateTenantStore(raw, scope.tenant, project.projectKey);
+        else if (!hasStatsIndex(raw)) raw.exec(CREATE_EVENTS_STATS_INDEX);
+        if (!isWalMode(raw)) raw.exec("PRAGMA journal_mode = WAL");
+      });
+    }
     const filter = `tenant=${quote(scope.tenant)} AND project_key=${quote(project.projectKey)}`;
     for (const table of TABLES) {
       // A contentless trigram index cannot return its UNINDEXED tenant column. Its rowid is

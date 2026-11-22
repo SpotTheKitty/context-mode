@@ -19,7 +19,7 @@ import { CtxError } from "../contracts/errors.ts";
 import type { DbHandle, ProjectContext } from "../contracts/types.ts";
 import { applyMigrations } from "./schema.ts";
 import { openReadOnlyHandle } from "./open-read.ts";
-import { httpScope } from "./http-scope.ts";
+import { httpScope, withHttpWriteLock } from "./http-scope.ts";
 import { openTenantDb } from "./tenant-store.ts";
 
 export type { DbHandle } from "../contracts/types.ts";
@@ -177,18 +177,20 @@ export async function openDb(project: ProjectContext, opts?: { readOnly?: boolea
 // ADR-0002 decision 2: every write transaction starts BEGIN IMMEDIATE. No retry loop on top of
 // DB_TIMEOUT_MS; a SQLITE_BUSY from BEGIN propagates unchanged (impl/02 §6.2).
 export function withWrite<T>(db: DbHandle, fn: (db: DbHandle) => T): T {
-  db.raw.exec("BEGIN IMMEDIATE");
-  try {
-    const result = fn(db);
-    // COMMIT inside the try: a failed COMMIT (busy, disk full) must not leave the connection in an
-    // open transaction that the next withWrite's BEGIN would trip over (review-M1 #3).
-    db.raw.exec("COMMIT");
-    return result;
-  } catch (err) {
-    // SQLite may already have rolled back (e.g. on SQLITE_FULL); ROLLBACK only an open transaction.
-    if (db.raw.isTransaction) db.raw.exec("ROLLBACK");
-    throw err;
-  }
+  return withHttpWriteLock(db.path, () => {
+    db.raw.exec("BEGIN IMMEDIATE");
+    try {
+      const result = fn(db);
+      // COMMIT inside the try: a failed COMMIT (busy, disk full) must not leave the connection in an
+      // open transaction that the next withWrite's BEGIN would trip over (review-M1 #3).
+      db.raw.exec("COMMIT");
+      return result;
+    } catch (err) {
+      // SQLite may already have rolled back (e.g. on SQLITE_FULL); ROLLBACK only an open transaction.
+      if (db.raw.isTransaction) db.raw.exec("ROLLBACK");
+      throw err;
+    }
+  });
 }
 
 // Every server checkpoints on its own close, no election (impl/02 §6.3). Never throws.

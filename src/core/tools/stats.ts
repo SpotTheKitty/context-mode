@@ -88,21 +88,15 @@ interface Facts {
 // events, not calls (D-M4-arch-4). Each own call and each host call has exactly one row, so no dedup here
 // (I1-14). D-STATS-REPORT-1: ctx_stats rows are left out; reading the report is not work, and counting its
 // reply made every call lower the percent a little.
+// Single narrow scan over events (never reading `body`, which can hold hundreds of MB of tool output);
+// the HTTP store covers these exact columns with idx_events_tenant_stats. TOOLS stays its own covering
+// query so snapshot tests intercepting `GROUP BY tool` between reads keep exercising the WAL transaction.
 const CALLS = "tool IS NOT NULL AND kind <> 'cost' AND tool <> 'ctx_stats'";
-const GROUPS =
-  "SELECT session_id, agent, COUNT(*) AS calls, COALESCE(SUM(sandbox_bytes), 0) AS produced," +
-  ` COALESCE(SUM(returned_bytes), 0) AS returned FROM events WHERE ${CALLS}` +
-  " GROUP BY session_id, agent ORDER BY agent, session_id";
+const EVENTS_FACTS =
+  "SELECT seq, session_id, agent, kind, tool, sandbox_bytes, returned_bytes, created_at FROM events WHERE kind <> 'cost'";
 const TOOLS =
   "SELECT tool, COUNT(*) AS calls, COALESCE(SUM(sandbox_bytes), 0) AS produced," +
   ` COALESCE(SUM(returned_bytes), 0) AS returned FROM events WHERE ${CALLS} GROUP BY tool`;
-const KINDS =
-  "SELECT kind, COALESCE(SUM(session_id = ?), 0) AS s, COUNT(*) AS p FROM events" +
-  " WHERE kind <> 'cost' AND (tool IS NULL OR tool <> 'ctx_stats') GROUP BY kind";
-const META =
-  "SELECT COUNT(DISTINCT session_id) AS sessions, COUNT(DISTINCT agent) AS agents," +
-  ` COUNT(DISTINCT created_at / ${MS_PER_DAY}) AS days FROM events WHERE ${CALLS}`;
-const SPAN = "SELECT COALESCE(MAX(created_at) - MIN(created_at), 0) AS span FROM events WHERE session_id = ? AND kind <> 'cost'";
 const SOURCES =
   "SELECT COUNT(*) AS n, COALESCE(SUM(chunk_count), 0) AS chunks, COALESCE(SUM(bytes_total), 0) AS bytes FROM sources";
 
@@ -110,20 +104,11 @@ const SOURCES =
 // PostToolUse hook replaced after it ran; a run.mjs source is a large command the PreToolUse hook sent to the
 // sandbox (ADR-0016 case B), which writes the source and no events row. A redirect saves its bytes past
 // OUTPUT_CAP (the reply the host would have shown is the capped preview).
-const HOST = "tool NOT LIKE 'ctx\\_%' ESCAPE '\\'";
-const REPLACED = `SELECT COUNT(*) AS n FROM events WHERE ${CALLS} AND ${HOST} AND returned_bytes < sandbox_bytes`;
 const RUNS = "FROM sources WHERE substr(label, 1, ?) = ?";
 const REDIRECTED = `SELECT COUNT(*) AS n, COALESCE(MAX(created_ts), 0) AS last ${RUNS}`;
-const LAST = `SELECT COALESCE(MAX(created_at), 0) AS last FROM events WHERE ${CALLS}`;
-const WEEK =
-  `SELECT created_at / ${MS_PER_DAY} AS day, tool, COUNT(*) AS calls, COALESCE(SUM(sandbox_bytes), 0) AS produced,` +
-  ` COALESCE(SUM(returned_bytes), 0) AS returned FROM events WHERE ${CALLS} AND created_at >= ? GROUP BY day, tool`;
 const WEEK_RUNS =
   `SELECT created_ts / ${MS_PER_DAY} AS day, COUNT(*) AS calls,` +
   ` COALESCE(SUM(MAX(0, bytes_total - ${OUTPUT_CAP})), 0) AS saved ${RUNS} AND created_ts >= ? GROUP BY day`;
-const TOP =
-  "SELECT tool, 1 AS calls, sandbox_bytes AS produced, returned_bytes AS returned FROM events" +
-  ` WHERE ${CALLS} AND sandbox_bytes > 0 ORDER BY sandbox_bytes DESC, seq ASC LIMIT ${STATS_TOP_OUTPUTS}`;
 
 function wayOf(tool: string): WayKey {
   if (STATS_INDEX_TOOLS.includes(tool)) return "index";
@@ -131,22 +116,22 @@ function wayOf(tool: string): WayKey {
 }
 
 // The last STATS_DAYS UTC days, ending on the day of the latest row: same journal, same days (no clock).
-function readWeek(raw: DatabaseSync, lastMs: number): Day[] {
+function readWeek(
+  raw: DatabaseSync,
+  lastMs: number,
+  dayCalls: Map<number, number>,
+  dayWayNet: Map<string, number>,
+): Day[] {
   const last = Math.floor(lastMs / MS_PER_DAY);
   const first = last - STATS_DAYS + 1;
   const days: Day[] = Array.from({ length: STATS_DAYS }, (_, i) => ({
     day: first + i, calls: 0, ways: { sandbox: 0, index: 0, redirect: 0, replace: 0 },
   }));
-  const net = new Map<string, number>();
-  for (const r of raw.prepare(WEEK).all(first * MS_PER_DAY) as Row[]) {
-    const d = days[Number(r.day) - first];
-    if (d === undefined) continue;
-    d.calls += Number(r.calls);
-    const key = `${d.day}:${wayOf(String(r.tool))}`;
-    net.set(key, (net.get(key) ?? 0) + Number(r.produced) - Number(r.returned));
-  }
   // Net bytes per day and way, like a saving unit: a ctx_search reply counts against the index it reads.
-  for (const d of days) for (const [way] of STATS_WAYS) d.ways[way] = Math.max(0, net.get(`${d.day}:${way}`) ?? 0);
+  for (const d of days) {
+    d.calls = dayCalls.get(d.day) ?? 0;
+    for (const [way] of STATS_WAYS) d.ways[way] = Math.max(0, dayWayNet.get(`${d.day}:${way}`) ?? 0);
+  }
   for (const r of raw.prepare(WEEK_RUNS).all(RUN_LABEL_PREFIX.length, RUN_LABEL_PREFIX, first * MS_PER_DAY) as Row[]) {
     const d = days[Number(r.day) - first];
     if (d === undefined) continue;
@@ -159,10 +144,12 @@ function readWeek(raw: DatabaseSync, lastMs: number): Day[] {
 const EMPTY: Totals = Object.freeze({ calls: 0, produced: 0, returned: 0, saved: 0 });
 type Row = Record<string, string | number | null>;
 
-function totals(r: Row): Totals {
-  const produced = Number(r.produced);
-  const returned = Number(r.returned);
-  return { calls: Number(r.calls), produced, returned, saved: Math.max(0, produced - returned) };
+function cmpStr(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function finalizeTotals(calls: number, produced: number, returned: number): Totals {
+  return { calls, produced, returned, saved: Math.max(0, produced - returned) };
 }
 
 // D-M4-S3-1: the saving unit is one agent's work in one session. Inside it, returned bytes are counted
@@ -170,26 +157,85 @@ function totals(r: Row): Totals {
 // more than it produced kept nothing out, so it adds 0, never a negative. Every scope and agent row is a
 // sum of whole units, so session <= project <= all-time and agent rows sum to all-time by construction.
 function readFacts(raw: DatabaseSync, sessionId: string): Facts {
-  const groups = (raw.prepare(GROUPS).all() as Row[]).map((r) => ({ session: String(r.session_id), agent: String(r.agent), ...totals(r) }));
-  const tools = (raw.prepare(TOOLS).all() as Row[]).map((r) => ({ name: String(r.tool), ...totals(r) }));
+  const groupAcc = new Map<string, { session: string; agent: string; calls: number; produced: number; returned: number }>();
   const kinds = new Map<string, { session: number; project: number }>();
-  for (const r of raw.prepare(KINDS).all(sessionId) as Row[]) kinds.set(String(r.kind), { session: Number(r.s), project: Number(r.p) });
-  const meta = raw.prepare(META).get() as Row;
-  const span = Number((raw.prepare(SPAN).get(sessionId) as Row).span);
+  const sessions = new Set<string>();
+  const agents = new Set<string>();
+  const activeDays = new Set<number>();
+  const dayCalls = new Map<number, number>();
+  const dayWayNet = new Map<string, number>();
+  const top: Array<{ seq: number; name: string; produced: number; returned: number }> = [];
+  let minSpan = Number.POSITIVE_INFINITY;
+  let maxSpan = Number.NEGATIVE_INFINITY;
+  let lastCall = 0;
+  let replaced = 0;
+
+  for (const r of raw.prepare(EVENTS_FACTS).all() as Row[]) {
+    const sid = String(r.session_id);
+    const createdAt = Number(r.created_at);
+    if (sid === sessionId) {
+      if (createdAt < minSpan) minSpan = createdAt;
+      if (createdAt > maxSpan) maxSpan = createdAt;
+    }
+    const tool = r.tool === null ? null : String(r.tool);
+    if (tool === "ctx_stats") continue;
+    const kind = String(r.kind);
+    const kc = kinds.get(kind);
+    if (kc === undefined) kinds.set(kind, { session: sid === sessionId ? 1 : 0, project: 1 });
+    else {
+      kc.project += 1;
+      if (sid === sessionId) kc.session += 1;
+    }
+    if (tool === null) continue;
+    const agent = String(r.agent);
+    const produced = Number(r.sandbox_bytes);
+    const returned = Number(r.returned_bytes);
+    const gKey = `${agent}\0${sid}`;
+    const g = groupAcc.get(gKey);
+    if (g === undefined) groupAcc.set(gKey, { session: sid, agent, calls: 1, produced, returned });
+    else { g.calls += 1; g.produced += produced; g.returned += returned; }
+    sessions.add(sid);
+    agents.add(agent);
+    const day = Math.trunc(createdAt / MS_PER_DAY);
+    activeDays.add(day);
+    if (createdAt > lastCall) lastCall = createdAt;
+    dayCalls.set(day, (dayCalls.get(day) ?? 0) + 1);
+    const wk = `${day}:${wayOf(tool)}`;
+    dayWayNet.set(wk, (dayWayNet.get(wk) ?? 0) + produced - returned);
+    if (!tool.startsWith("ctx_") && returned < produced) replaced += 1;
+    if (produced > 0) {
+      const seq = Number(r.seq);
+      const worst = top.length < STATS_TOP_OUTPUTS ? null : top[top.length - 1]!;
+      if (worst === null || produced > worst.produced || (produced === worst.produced && seq < worst.seq)) {
+        top.push({ seq, name: tool, produced, returned });
+        top.sort((a, b) => b.produced - a.produced || a.seq - b.seq);
+        if (top.length > STATS_TOP_OUTPUTS) top.pop();
+      }
+    }
+  }
+
+  const groups: Group[] = [...groupAcc.values()]
+    .sort((a, b) => cmpStr(a.agent, b.agent) || cmpStr(a.session, b.session))
+    .map((g) => ({ session: g.session, agent: g.agent, ...finalizeTotals(g.calls, g.produced, g.returned) }));
+  const tools: Named[] = (raw.prepare(TOOLS).all() as Row[]).map((r) => ({
+    name: String(r.tool),
+    ...finalizeTotals(Number(r.calls), Number(r.produced), Number(r.returned)),
+  }));
+  const span = minSpan === Number.POSITIVE_INFINITY ? 0 : maxSpan - minSpan;
   const src = raw.prepare(SOURCES).get() as Row;
   const runs = raw.prepare(REDIRECTED).get(RUN_LABEL_PREFIX.length, RUN_LABEL_PREFIX) as Row;
-  const last = Math.max(Number((raw.prepare(LAST).get() as Row).last), Number(runs.last));
+  const last = Math.max(lastCall, Number(runs.last));
   const pages = raw.prepare("PRAGMA page_count").get() as Row;
   const size = raw.prepare("PRAGMA page_size").get() as Row;
   return {
     groups, tools, kinds, span,
-    sessions: Number(meta.sessions), agents: Number(meta.agents), days: Number(meta.days),
+    sessions: sessions.size, agents: agents.size, days: activeDays.size,
     sources: { count: Number(src.n), chunks: Number(src.chunks), bytes: Number(src.bytes) },
     dbBytes: Number(pages.page_count) * Number(size.page_size),
-    top: (raw.prepare(TOP).all() as Row[]).map((r) => ({ name: String(r.tool), ...totals(r) })),
-    replaced: Number((raw.prepare(REPLACED).get() as Row).n),
+    top: top.map((r) => ({ name: r.name, ...finalizeTotals(1, r.produced, r.returned) })),
+    replaced,
     redirected: Number(runs.n),
-    week: readWeek(raw, last),
+    week: readWeek(raw, last, dayCalls, dayWayNet),
   };
 }
 
