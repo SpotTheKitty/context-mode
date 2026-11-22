@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -53,5 +53,51 @@ test("the first search of a diverted memory result reaches the model", async () 
   } finally {
     await new Promise((resolve) => server.close(resolve));
     rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+// T1007: the pointer a diverted result ends with is a call that works as written. The session's working folder is outside the
+// server's session root (on the workstation: a T3 worktree outside F:/Projects); the pointer must carry that folder, and its
+// first query must not be empty.
+test("the diversion pointer reaches the stored text from a folder outside the session root", async () => {
+  const base = mkdtempSync(join(tmpdir(), "cm-pointer-ws-"));
+  const sessionRoot = join(base, "projects");
+  const outside = join(base, "outside-worktree");
+  mkdirSync(sessionRoot);
+  mkdirSync(outside);
+  const server = await listenHttp({
+    host: "127.0.0.1", port: 0, path: "/mcp", tenantHeader: "x-context-tenant", sessionRoot,
+    maxRequestBytes: 1_000_000, dataDir: join(base, "data"), tenants: { claude: { agent: "claude-code", toolPrefix: "mcp__contextMode__" } },
+  });
+  try {
+    const post = async (suffix, body) => {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}/mcp${suffix}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json,text/event-stream", "x-context-tenant": "claude" },
+        body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    const memory = Array.from({ length: 20 }, (_, i) => `### milestone${i}proof\n${`The milestone${i}proof was recorded in memory.\n`.repeat(12)}`).join("\n");
+    const diverted = await post("/hooks", {
+      hook_event_name: "PostToolUse", session_id: "pointer-test", cwd: outside,
+      tool_name: "mcp__fastmcp_gateway__mem_search", tool_input: { query: "milestone proof", limit: 20 },
+      tool_response: [{ type: "text", text: memory }],
+    });
+    const preview = JSON.parse(diverted.stdout).hookSpecificOutput.updatedToolOutput[0].text;
+    const call = /(ctx_search\(\{.*\}\)) searches the whole output/.exec(preview)?.[1];
+    assert.ok(call, preview);
+    const args = new Function(`const ctx_search = (a) => a; return ${call};`)();
+    assert.notEqual(args.queries[0], "", "the first suggested query is empty: " + call);
+
+    const reply = await post("", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "ctx_search", arguments: args } });
+    assert.equal(reply.result.isError, false, JSON.stringify(reply));
+    const text = reply.result.content[0].text;
+    assert.doesNotMatch(text, /Workspace fallback|No hits/, `the pointer, run as written, found nothing: ${call}\n${text}`);
+    assert.match(text, /milestone0proof/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(base, { recursive: true, force: true });
   }
 });

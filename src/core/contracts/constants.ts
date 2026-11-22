@@ -51,9 +51,12 @@ export const REPLACE_CHUNK_BYTES = 48; // D-M7-SV-3: was 256; two whole chunks f
 // D-R4-HANDLE-LABEL-1: no label text; the short id is the only name the line carries.
 // D-HL-NAMES-1: the tool name carries the host's toolNamePrefix; the intent is never rewritten.
 // D-HA-GEMINI-HINT-1: `asked` (prompt words the output holds) is a second query; the intent query stays as is.
-export function REPLACE_HANDLE_LINE(intent: string, handle: string, bytes: number, prefix = "", asked = ""): string {
+// T1007: on the HTTP tenant server `workspace` (the worktree the source was stored under) is in the call, so the call
+// reaches the stored text as written from any working folder; without it the server searches its fallback workspace.
+export function REPLACE_HANDLE_LINE(intent: string, handle: string, bytes: number, prefix = "", asked = "", workspace = ""): string {
   const queries = asked === "" ? [intent] : [intent, asked];
-  return prefix + "ctx_search({queries:[" + queries.map((q) => JSON.stringify(q)).join(",") + "], source:" + JSON.stringify(handle) + "}) searches the whole output (" + bytes + " B).";
+  const where = workspace === "" ? "" : ", _workspace:" + JSON.stringify(workspace);
+  return prefix + "ctx_search({queries:[" + queries.map((q) => JSON.stringify(q)).join(",") + "]" + where + ", source:" + JSON.stringify(handle) + "}) searches the whole output (" + bytes + " B).";
 }
 export const HANDLE_PROMPT_WORDS = 3; // D-HA-GEMINI-HINT-1: prompt words the handle-line query may add
 export const MAX_CHUNK_BYTES = 4096; // DECISIONS-r9 §C

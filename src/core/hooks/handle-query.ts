@@ -5,6 +5,24 @@
 import { HANDLE_PROMPT_WORDS } from "../contracts/constants.ts";
 import { wordTokens } from "../store/words.ts";
 
+// T1007: a tool with none of description, command, file path, pattern or URL (an MCP search such as mem_search) used to
+// give an empty first query. The fallback is the tool's own name plus the words of its string arguments, never empty.
+export const TOOL_INTENT_ARG_WORDS = 6;
+export function toolIntent(canonicalName: string, input: Record<string, unknown>): string {
+  const name = wordTokens(canonicalName.slice(canonicalName.lastIndexOf(":") + 1).toLowerCase());
+  const seen = new Set(name);
+  const args: string[] = [];
+  for (const value of Object.values(input)) {
+    if (typeof value !== "string") continue;
+    for (const w of wordTokens(value.toLowerCase())) {
+      if (seen.has(w) || args.length >= TOOL_INTENT_ARG_WORDS) continue;
+      seen.add(w); args.push(w);
+    }
+  }
+  const words = [...name, ...args];
+  return words.length === 0 ? canonicalName : words.join(" ");
+}
+
 export function askedWords(intent: string, prompt: string, text: string): string {
   const want = new Set(wordTokens(prompt.toLowerCase()));
   for (const w of wordTokens(intent.toLowerCase())) want.delete(w);

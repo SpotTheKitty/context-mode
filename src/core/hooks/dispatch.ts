@@ -36,7 +36,7 @@ import { moreLine, selectChunksInMemory } from "../index/select.ts";
 import { shapeDigest } from "../index/shape.ts";
 import { indexText } from "../index/text.ts";
 import { appendDetached } from "./detached.ts";
-import { askedWords } from "./handle-query.ts";
+import { askedWords, toolIntent } from "./handle-query.ts";
 import { answerDecisions, askOptionLabels, optionEchoDecision, type DecisionPart } from "./decision.ts";
 import { shouldHint } from "./throttle.ts";
 import { CtxError } from "../contracts/errors.ts";
@@ -478,7 +478,7 @@ async function postReplace(ev: CanonicalHookEvent, row: AdapterRow, project: Pro
   }
   // D-M7-RR-3: no description -> the command text, file path, pattern or URL, never an empty query.
   const intent = [tool.input.description, tool.input.command, tool.input.file_path, tool.input.pattern, tool.input.url]
-    .map(str).find((v) => v.trim() !== "") ?? "";
+    .map(str).find((v) => v.trim() !== "") ?? toolIntent(tool.canonicalName, tool.input); // T1007: never an empty query
   // One chunk pass for both forms (D-M7-FT-2): the stored chunks and the selected chunks are the same
   // array, so the in-memory selection equals selectChunks over the stored source without reading it back.
   const chunks = chunkText(text, "text", REPLACE_CHUNK_BYTES); // D-M7-SV-1: small chunks, line-aligned cuts
@@ -505,7 +505,10 @@ async function postReplace(ev: CanonicalHookEvent, row: AdapterRow, project: Pro
   // replace is the size bound of D-CR3-HANDLE-1 (REPLACE_RETURN_BYTES of selection + the more line with the full
   // label); the selection gets that budget minus the handle line, so a replace never grows.
   // D-HA-GEMINI-HINT-1: a second query of the prompt words the output holds, so the call returns the asked line.
-  const handleLine = REPLACE_HANDLE_LINE(intent, handle, result.bytes, row.toolNamePrefix, askedWords(intent, prompt, text));
+  // T1007: the HTTP server keeps every project in one store and resolves the project of a call from its _workspace, so the
+  // pointer carries the worktree the source was stored under. The stdio server is one project: no _workspace there.
+  const workspace = httpScope.getStore() === undefined ? "" : project.worktree.replaceAll("\\", "/");
+  const handleLine = REPLACE_HANDLE_LINE(intent, handle, result.bytes, row.toolNamePrefix, askedWords(intent, prompt, text), workspace);
   const budget = replaceBudget(handleLine, moreLine(intent, label));
   const digest = shapeDigest(text, rankQuery ?? intent, SHAPE_RETURN_BYTES); // D-M2-JSON-1
   if (digest !== null) return { kind: "replace", output: replaceOutput(digest, handleLine) };
