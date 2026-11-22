@@ -46,6 +46,8 @@ export const REPLACE_RETURN_BYTES = 96; // D-M7-SV-3: was 512 (D-M7-SV-2), 1024 
 // D-M2-JSON-1: a parser-found shape digest (schema, counts, whole rows) has its own budget, independent of the handle line.
 export const SHAPE_RETURN_BYTES = 256;
 export const REPLACE_CHUNK_BYTES = 48; // D-M7-SV-3: was 256; two whole chunks fit in the return budget
+// T1021: a result in a tool's excerptBands band is chunked at this size, so the excerpts it returns are readable passages.
+export const EXCERPT_CHUNK_BYTES = 256;
 // D-CR3-HANDLE-1: the last line of every replacement (it replaces the more line and the D-CR2-HANDLE-1 line).
 // One short line: the exact call over the stored source by its short id, then the full size.
 // D-R4-HANDLE-LABEL-1: no label text; the short id is the only name the line carries.

@@ -129,3 +129,36 @@ test("a tool listed in inlineLimits is returned whole up to its limit; others ar
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+// T1021: between a tool's whole limit and its band's upToBytes, a hook returns the excerpts that best match the call's own arguments
+// (about returnBytes of them) plus the pointer; above upToBytes the small diversion is unchanged.
+test("a result in a tool's excerpt band returns the excerpts that match its arguments plus the pointer", async () => {
+  const base = mkdtempSync(join(tmpdir(), "cm-excerpt-band-"));
+  const server = await listenHttp({
+    host: "127.0.0.1", port: 0, path: "/mcp", tenantHeader: "x-context-tenant", excerptBands: { "mcp__fastmcp-gateway__mem_search": { upToBytes: 65536, returnBytes: 1500 } },
+    maxRequestBytes: 1_000_000, dataDir: join(base, "data"), tenants: { claude: { agent: "claude-code", toolPrefix: "mcp__contextMode__" } },
+  });
+  try {
+    const hook = async (text) => {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}/mcp/hooks`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json,text/event-stream", "x-context-tenant": "claude" },
+        body: JSON.stringify({ hook_event_name: "PostToolUse", session_id: "band-test", cwd: base, tool_name: "mcp__fastmcp-gateway__mem_search", tool_input: { query: "milestone17proof", limit: 40 }, tool_response: [{ type: "text", text }] }),
+      });
+      assert.equal(response.status, 200);
+      return JSON.parse((await response.json()).stdout).hookSpecificOutput.updatedToolOutput[0].text;
+    };
+    const rows = (count) => Array.from({ length: count }, (_, i) => `### milestone${i}proof\n${`The milestone${i}proof was recorded in memory.\n`.repeat(8)}`).join("\n");
+    const band = await hook(rows(60));
+    assert.ok(Buffer.byteLength(rows(60)) > REPLACE_TRIGGER_BYTES && Buffer.byteLength(rows(60)) <= 65536, "fixture sits in the band");
+    assert.match(band, /The milestone17proof was recorded in memory/, "the excerpt that matches the call's argument is returned");
+    assert.match(band, /ctx_search\(\{.*\}\) searches the whole output/, "the pointer for the rest is returned");
+    assert.ok(Buffer.byteLength(band) > 600 && Buffer.byteLength(band) < 2000, `excerpts of about returnBytes, got ${Buffer.byteLength(band)}`);
+    const above = await hook(rows(400));
+    assert.ok(Buffer.byteLength(rows(400)) > 65536, "fixture is above the band");
+    assert.ok(Buffer.byteLength(above) < Buffer.byteLength(band) / 2, "above upToBytes the small diversion is unchanged");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(base, { recursive: true, force: true });
+  }
+});

@@ -1,6 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
-export interface HttpScope { tenant: string; database: string; toolPrefix?: string; inlineLimits?: Readonly<Record<string, number>>; pending?: Set<Promise<unknown>>; closers?: Set<() => void>; }
+/** T1021: a result above the tool's whole limit and up to `upToBytes` comes back as about `returnBytes` of excerpts plus the pointer. */
+export interface ExcerptBand { upToBytes: number; returnBytes: number; }
+export interface HttpScope { tenant: string; database: string; toolPrefix?: string; inlineLimits?: Readonly<Record<string, number>>; excerptBands?: Readonly<Record<string, ExcerptBand>>; pending?: Set<Promise<unknown>>; closers?: Set<() => void>; }
 export const httpScope = new AsyncLocalStorage<HttpScope>();
 
 export async function settleHttpScope(): Promise<void> {

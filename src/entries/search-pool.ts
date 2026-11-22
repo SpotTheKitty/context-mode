@@ -6,6 +6,7 @@
 import { Worker } from "node:worker_threads";
 import type { AgentId, HookOutput, ToolReply } from "../core/contracts/types.ts";
 import type { ProjectSourceInput } from "../core/project/resolve.ts";
+import type { ExcerptBand } from "../core/store/http-scope.ts";
 
 /** The worker resolves the project itself from `source`: a resolved ProjectContext has lazy getters, and
  * structured-cloning it would run its `git worktree list` (about 180 ms of event loop) for a field a search never reads. */
@@ -21,6 +22,8 @@ export interface HookJob {
   tenant: string; database: string; toolPrefix?: string;
   /** T1011: per-tool inline limit in bytes, from the contextMode table. */
   inlineLimits?: Readonly<Record<string, number>>;
+  /** T1021: per-tool middle band (excerpts plus the pointer), from the contextMode table. */
+  excerptBands?: Readonly<Record<string, ExcerptBand>>;
 }
 type WorkerOutcome<Reply> = { kind: "reply"; reply: Reply } | { kind: "timeout"; started: boolean } | { kind: "failed"; message: string };
 export type WorkerMessage = { id: number; reply: ToolReply | HookOutput } | { id: number; error: string };

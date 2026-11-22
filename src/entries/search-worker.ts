@@ -26,7 +26,7 @@ export async function runSearchJob(job: SearchJob, signal: AbortSignal): Promise
 }
 
 function runHookJob(job: HookJob) {
-  return httpScope.run({ tenant: job.tenant, database: job.database, toolPrefix: job.toolPrefix, inlineLimits: job.inlineLimits }, async () => {
+  return httpScope.run({ tenant: job.tenant, database: job.database, toolPrefix: job.toolPrefix, inlineLimits: job.inlineLimits, excerptBands: job.excerptBands }, async () => {
     try {
       return await handleHook(job.adapter, job.raw, job.env);
     } finally {

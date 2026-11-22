@@ -10,7 +10,7 @@ import { TOOLS } from "../core/tools/registry.ts";
 import { resolveProject } from "../core/project/resolve.ts";
 import { appendEvent, ownCallRow } from "../core/journal/append.ts";
 import { closeDb, openDb } from "../core/store/db.ts";
-import { httpScope, settleHttpScope } from "../core/store/http-scope.ts";
+import { httpScope, settleHttpScope, type ExcerptBand } from "../core/store/http-scope.ts";
 import type { AgentId, HookOutput, ToolContext, ToolReply } from "../core/contracts/types.ts";
 import { DB_FILE_NAME, HOOK_TIMEOUT_MS } from "../core/contracts/constants.ts";
 import { SEARCH_WORKER_ROLE, RequestPool, type HookJob, type SearchJob } from "./search-pool.ts";
@@ -27,6 +27,9 @@ export interface HttpConfig {
   hookTimeoutMs?: number;
   /** T1011: tool name (as the host sends it, or its canonical form) -> bytes of its result a hook returns whole. Above it the result is diverted. */
   inlineLimits?: Record<string, number>;
+  /** T1021: tool name -> the middle band: above the tool's whole limit and up to upToBytes, a hook returns about returnBytes of excerpts
+   *  that best match the call's own arguments, plus the pointer for the rest. Above upToBytes the diversion is unchanged. */
+  excerptBands?: Record<string, ExcerptBand>;
 }
 /** Test seam: `searchStall` returns how long to block the thread that runs a search before it starts, as a long SQLite statement would. */
 export interface HttpOptions { searchStall?: (args: unknown) => number; }
@@ -67,6 +70,11 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
   const inlineLimits = config.inlineLimits;
   if (inlineLimits !== undefined && (typeof inlineLimits !== "object" || inlineLimits === null || Array.isArray(inlineLimits) ||
       !Object.values(inlineLimits).every((n) => Number.isSafeInteger(n) && n > 0))) throw new Error("invalid contextMode inlineLimits");
+  const excerptBands = config.excerptBands;
+  const bandOk = (b: unknown): boolean => typeof b === "object" && b !== null && !Array.isArray(b) &&
+    [(b as ExcerptBand).upToBytes, (b as ExcerptBand).returnBytes].every((n) => Number.isSafeInteger(n) && n > 0);
+  if (excerptBands !== undefined && (typeof excerptBands !== "object" || excerptBands === null || Array.isArray(excerptBands) ||
+      !Object.values(excerptBands).every(bandOk))) throw new Error("invalid contextMode excerptBands");
   const entry = fileURLToPath(import.meta.url);
   const pool = searchWorkers > 0 ? new RequestPool<SearchJob, ToolReply>(entry, searchWorkers, "search") : null;
   // Keep hook indexing and SQLite lock waits off the listener. A single worker orders hook writes
@@ -80,7 +88,7 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
       const tenant = incoming.headers[config.tenantHeader.toLowerCase()];
       if (typeof tenant !== "string" || !Object.hasOwn(config.tenants,tenant)) {outgoing.writeHead(403).end("unknown tenant"); return;}
       const agent = config.tenants[tenant]!.agent;
-      await httpScope.run({tenant,database,toolPrefix:config.tenants[tenant]!.toolPrefix,inlineLimits},async () => {
+      await httpScope.run({tenant,database,toolPrefix:config.tenants[tenant]!.toolPrefix,inlineLimits,excerptBands},async () => {
         const chunks: Buffer[] = []; let bytes=0;
         for await (const chunk of incoming) {
           bytes += chunk.length;
@@ -97,7 +105,7 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
           if (adapter !== agent && !Object.hasOwn(adapters ?? {},adapter)) {outgoing.writeHead(403).end("unknown hook adapter");return;}
           const toolPrefix = adapters?.[adapter]?.toolPrefix ?? config.tenants[tenant]!.toolPrefix;
           const raw: unknown = wrapped ? input.raw : input;
-          const result = await hooks.run({adapter,raw,env,tenant,database,toolPrefix,inlineLimits},hookTimeoutMs);
+          const result = await hooks.run({adapter,raw,env,tenant,database,toolPrefix,inlineLimits,excerptBands},hookTimeoutMs);
           if (result.kind !== "reply") {
             const reason = result.kind === "failed" ? result.message : `context-mode hook exceeded ${hookTimeoutMs} ms (hookTimeoutMs)`;
             console.error(reason);

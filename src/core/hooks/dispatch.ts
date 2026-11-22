@@ -4,11 +4,11 @@
 // D-CI-PERF-7: node:fs through getBuiltinModule; a static ESM import of node:fs also loads fs/promises, readline and streams.
 const { lstatSync, readFileSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { httpScope } from "../store/http-scope.ts";
+import { httpScope, type ExcerptBand } from "../store/http-scope.ts";
 import { AGENT_IDS, type AgentId } from "../contracts/agents.ts";
 import {
   COMPACTED_META_PREFIX, COMPACT_POINTER_LINE, COMPACT_STATE_KEY, DECISION_OPTION_KEY, DECISION_SOURCE, DECISION_TOOL, EDIT_PATH_KEYS, EDIT_TOOLS, EXIT_CODE_LINE_PREFIX,
-  OWN_TOOL_PREFIX, prefixToolNames, REPLACE_CHUNK_BYTES, REPLACE_HANDLE_LINE, REPLACE_RETURN_BYTES, REPLACE_TRIGGER_BYTES, RANGE_READ_TOOLS, READ_PATH_KEYS, READ_RANGE_KEYS, SHAPE_RETURN_BYTES, PARSE_ERROR_DENY_LINE, PENDING_COMPACT_FLAG, PENDING_COMPACT_KEY,
+  OWN_TOOL_PREFIX, prefixToolNames, EXCERPT_CHUNK_BYTES, REPLACE_CHUNK_BYTES, REPLACE_HANDLE_LINE, REPLACE_RETURN_BYTES, REPLACE_TRIGGER_BYTES, RANGE_READ_TOOLS, READ_PATH_KEYS, READ_RANGE_KEYS, SHAPE_RETURN_BYTES, PARSE_ERROR_DENY_LINE, PENDING_COMPACT_FLAG, PENDING_COMPACT_KEY,
   PENDING_COMPACT_META_PREFIX, POLICY_UNREADABLE_LINE, RECALL_KEY, RECALL_MAX_ROWS, RECALL_SEEN_META_PREFIX, RECALL_UNIT_CANDIDATES, RECALL_UNITS_SEEN_META_PREFIX, RESUME_HINT, RESUME_HINT_KEY, RUN_WRAPPER_FILE,
   RUN_WRAPPER_NODE, SHELL_TOOL, SOURCE_LABEL_MAX_CHARS, SUBAGENT_SOURCE_PREFIX, SYNC_INDEX_MAX_BYTES, TOOL_PREFIX_SLOT,
   USER_DENY_REASON_PREFIX,
@@ -466,6 +466,22 @@ function replaceTrigger(tool: ToolCall): number {
   return own === undefined ? REPLACE_TRIGGER_BYTES : Math.max(limits[own]!, REPLACE_TRIGGER_BYTES);
 }
 
+/** T1021: the middle band of a tool (data, keyed like inlineLimits) when this result sits in it: above the tool's whole limit and up to
+ *  upToBytes. null otherwise, and the diversion is unchanged. */
+function excerptBandOf(tool: ToolCall, bytes: number): ExcerptBand | null {
+  const bands = httpScope.getStore()?.excerptBands;
+  if (bands === undefined) return null;
+  const own = [tool.name, tool.canonicalName].find((key) => Object.hasOwn(bands, key));
+  const band = own === undefined ? undefined : bands[own];
+  return band !== undefined && bytes > replaceTrigger(tool) && bytes <= band.upToBytes ? band : null;
+}
+
+/** T1021: the words the band ranks excerpts by: the call's own arguments (every string and number value), after the intent. */
+function argumentQuery(tool: ToolCall, intent: string): string {
+  const own = Object.values(tool.input).filter((v) => typeof v === "string" || typeof v === "number").map(String);
+  return [intent, ...own].join(" ");
+}
+
 async function postReplace(ev: CanonicalHookEvent, row: AdapterRow, project: ProjectContext, env: NodeJS.ProcessEnv,
   tool: ToolCall, result: ToolResultInfo, text: string): Promise<Decision> {
   // step 5: replace, DECISIONS-r9 F1 split. Subagent case B/C (ADR-0016), and the main agent on a row
@@ -490,7 +506,8 @@ async function postReplace(ev: CanonicalHookEvent, row: AdapterRow, project: Pro
     .map(str).find((v) => v.trim() !== "") ?? toolIntent(tool.canonicalName, tool.input); // T1007: never an empty query
   // One chunk pass for both forms (D-M7-FT-2): the stored chunks and the selected chunks are the same
   // array, so the in-memory selection equals selectChunks over the stored source without reading it back.
-  const chunks = chunkText(text, "text", REPLACE_CHUNK_BYTES); // D-M7-SV-1: small chunks, line-aligned cuts
+  const band = excerptBandOf(tool, result.bytes); // T1021: in the tool's middle band: readable chunks, a larger budget, ranked by the call's arguments
+  const chunks = chunkText(text, "text", band === null ? REPLACE_CHUNK_BYTES : EXCERPT_CHUNK_BYTES); // D-M7-SV-1: small chunks, line-aligned cuts
   // D-CR3-HANDLE-1: the handle is the short id of the stored row. Up to SYNC_INDEX_MAX_BYTES the whole write
   // is sync; above it (F1) only the source row is written now (one small row, D-CR3-HANDLE-2) and the
   // chunks and line units follow detached under that id, so the handle never falls back to the long label.
@@ -507,7 +524,7 @@ async function postReplace(ev: CanonicalHookEvent, row: AdapterRow, project: Pro
   // D-M7-SV-5: rank by the intent and the session's last user prompt (any word), so a bare cat still
   // returns the line the user asked for. The more line keeps the intent. No prompt -> intent alone.
   const prompt = await lastPrompt(project, ev.sessionId);
-  const rankQuery = prompt.trim() === "" ? undefined : intent + " " + prompt;
+  const rankQuery = band !== null ? argumentQuery(tool, intent) : prompt.trim() === "" ? undefined : intent + " " + prompt;
   // D-M2-SHAPE-1: a parser-found shape (JSON rows, a line log) gives its rare units the query names, whole,
   // within the same budget, plus the handle. No shape or no named rare unit -> the BM25 pick below, unchanged.
   // D-CR3-HANDLE-1: one handle line replaces the more line and counts inside the budget. The budget per
@@ -518,8 +535,8 @@ async function postReplace(ev: CanonicalHookEvent, row: AdapterRow, project: Pro
   // pointer carries the worktree the source was stored under. The stdio server is one project: no _workspace there.
   const workspace = httpScope.getStore() === undefined ? "" : project.worktree.replaceAll("\\", "/");
   const handleLine = REPLACE_HANDLE_LINE(intent, handle, result.bytes, row.toolNamePrefix, askedWords(intent, prompt, text), workspace);
-  const budget = replaceBudget(handleLine, moreLine(intent, label));
-  const digest = shapeDigest(text, rankQuery ?? intent, SHAPE_RETURN_BYTES); // D-M2-JSON-1
+  const budget = replaceBudget(handleLine, moreLine(intent, label), band?.returnBytes);
+  const digest = band !== null ? null : shapeDigest(text, rankQuery ?? intent, SHAPE_RETURN_BYTES); // D-M2-JSON-1; the band returns excerpts
   if (digest !== null) return { kind: "replace", output: replaceOutput(digest, handleLine) };
   const selected = selectChunksInMemory(chunks, intent, budget, label, rankQuery);
   return { kind: "replace", output: selected.more !== null ? replaceOutput(selected.text, handleLine) : selected.text };
@@ -538,8 +555,8 @@ export function replaceOutput(body: string, handleLine: string): string {
 
 // D-R4-BUDGET-1: the selection budget left after the handle line and the newline that joins it to the body.
 // It never goes below 0 (a handle line longer than the more line plus REPLACE_RETURN_BYTES leaves no room for a body).
-export function replaceBudget(handleLine: string, more: string): number {
-  return Math.max(0, REPLACE_RETURN_BYTES + Buffer.byteLength("\n" + more) - 1 - Buffer.byteLength(handleLine));
+export function replaceBudget(handleLine: string, more: string, returnBytes: number = REPLACE_RETURN_BYTES): number {
+  return Math.max(0, returnBytes + Buffer.byteLength("\n" + more) - 1 - Buffer.byteLength(handleLine));
 }
 
 // D-SEC-PERSIST-1: a persisted output is read only at <claude dir>/projects/<project>/<this session>/tool-results/<file>:
