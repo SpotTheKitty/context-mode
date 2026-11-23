@@ -1,5 +1,5 @@
 import { createServer as createHttpServer, type Server } from "node:http";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -283,7 +283,7 @@ export async function listenHttp(config: HttpConfig, options: HttpOptions = {}):
 // A worker is this same file started as a thread: it must not read argv (copied from the parent) and listen.
 if (!isMainThread && (workerData as {role?: string} | null)?.role === SEARCH_WORKER_ROLE) {
   serveSearchWorker();
-} else if (isMainThread && process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+} else if (isMainThread && process.argv[1] && existsSync(process.argv[1]) && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   const table = JSON.parse(readFileSync(process.argv[2]!,"utf8"));
   const config = configFromEndpointTable(table);
   if (process.argv.includes("--build-stats-index")) {

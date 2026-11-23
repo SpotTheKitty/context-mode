@@ -597,6 +597,8 @@ export class RequestPool<Job extends ToolJob | HookJob, Reply extends ToolReply 
       pending.resolve({ kind: "timeout", started: false });
       return;
     }
+    // Keep the slot occupied during cancellation, but reply at the request deadline.
+    pending.resolve({ kind: "timeout", started: true });
     this.beginCancel(slot, pending);
   }
 
