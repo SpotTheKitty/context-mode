@@ -992,9 +992,13 @@ describe("PRD-v2 section 10: compaction delivery, recall and decision rows (GP6)
 
   async function longSession(agent, s, promptEvent) {
     for (const p of [...FILLER, ...FILLER]) await handleHook(agent, payload(s, { hook_event_name: promptEvent, prompt: p }), env);
+    const error = "zebraquux migration failed: ETIMEDOUT connecting to db-replica-7";
+    const gemini = agent === "gemini";
     await handleHook(agent, payload(s, {
-      hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "npm run migrate:zebraquux" },
-      tool_response: { stdout: "", stderr: "zebraquux migration failed: ETIMEDOUT connecting to db-replica-7", is_error: true },
+      hook_event_name: gemini ? "AfterTool" : "PostToolUse",
+      tool_name: gemini ? "run_shell_command" : "Bash",
+      tool_input: { command: "npm run migrate:zebraquux" },
+      tool_response: gemini ? { llmContent: error, error: { message: error } } : { stdout: "", stderr: error, is_error: true },
     }), env);
     await waitRows("SELECT seq FROM events WHERE session_id = ?", [s], 2 * FILLER.length + 1);
   }
@@ -1026,6 +1030,18 @@ describe("PRD-v2 section 10: compaction delivery, recall and decision rows (GP6)
     // below threshold: an unrelated prompt adds nothing
     const off = await handleHook("claude-code", payload(s, { hook_event_name: "UserPromptSubmit", prompt: "what is the weather" }), env);
     assert.deepEqual(off, { stdout: "", exitCode: 0 });
+  });
+
+  test("T1173: recall after compaction reads only the asking session's journal", async () => {
+    const asking = sid();
+    const other = sid();
+    await longSession("claude-code", asking, "UserPromptSubmit");
+    await longSession("claude-code", other, "UserPromptSubmit");
+    const errorSeq = (session) => query("SELECT seq FROM events WHERE session_id = ? AND kind = 'toolerr'", session)[0].seq;
+    await handleHook("claude-code", payload(asking, { hook_event_name: "SessionStart", source: "compact" }), env);
+    const text = context(await handleHook("claude-code", payload(asking, { hook_event_name: "UserPromptSubmit", prompt: ASK_ERROR }), env));
+    assert.ok(text?.includes("#" + errorSeq(asking) + " toolerr"), String(text));
+    assert.ok(!text.includes("#" + errorSeq(other) + " toolerr"), "foreign session in recall: " + text);
   });
 
   // #1330 (Lcstyle, aron-intframe): the first prompt is 30 KB of the README; a later output holds README lines and

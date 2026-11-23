@@ -237,7 +237,7 @@ function seenUnitKeys(value: string | null): string[] {
 }
 
 // No compaction in this session (or a row without UserPromptSubmit additionalContext): ALLOW, zero added
-// bytes. After one: BM25 of this session's rows and the same worktree's prior-session rows against the
+// bytes. After one: BM25 of this session's rows against the
 // prompt; whole rows over RECALL_MIN_SCORE, within RECALL_BUDGET_BYTES; a row goes out once per session.
 async function recall(ev: CanonicalHookEvent, row: AdapterRow, project: ProjectContext, prompt: string): Promise<Decision> {
   if (!hasRecall(row) || ev.sessionId === "") return ALLOW;
@@ -249,7 +249,7 @@ async function recall(ev: CanonicalHookEvent, row: AdapterRow, project: ProjectC
   const unitsKey = RECALL_UNITS_SEEN_META_PREFIX + ev.sessionId;
   const seenUnits = seenUnitKeys(metaGet(db, unitsKey));
   const units = queryUnits(db, ev.sessionId, recallQueryText(prompt), RECALL_UNIT_CANDIDATES);
-  const picked = pickRecall(readRecallRows(db, ev.sessionId, project.worktree, RECALL_MAX_ROWS), prompt, new Set(seen), units, new Set(seenUnits));
+  const picked = pickRecall(readRecallRows(db, ev.sessionId, RECALL_MAX_ROWS), prompt, new Set(seen), units, new Set(seenUnits));
   if (picked.text === "") return ALLOW;
   if (picked.seqs.length > 0) metaSet(db, seenKey, JSON.stringify([...seen, ...picked.seqs]));
   if (picked.units !== undefined) metaSet(db, unitsKey, JSON.stringify([...seenUnits, ...picked.units]));

@@ -42,15 +42,12 @@ export function readFirstPrompt(db: DbHandle, sessionId: string): string {
   return row === undefined ? "" : row.body;
 }
 
-/**
- * DECISIONS-r11 (B): recall candidates, newest first. This session's rows plus the same worktree's rows of
- * prior sessions (ADR-0009 §8 rule 2: always filter by the current worktree). Cost rows carry no text.
- */
-export function readRecallRows(db: DbHandle, sessionId: string, worktree: string, limit: number): JournalRow[] {
+/** Recent non-cost journal rows from the asking session. */
+export function readRecallRows(db: DbHandle, sessionId: string, limit: number): JournalRow[] {
   if (sessionId === "") return [];
   return db.raw
-    .prepare("SELECT * FROM events WHERE kind <> 'cost' AND (session_id = ? OR worktree = ?) ORDER BY seq DESC LIMIT ?")
-    .all(sessionId, worktree, limit) as unknown as JournalRow[];
+    .prepare("SELECT * FROM events WHERE session_id = ? AND kind <> 'cost' ORDER BY seq DESC LIMIT ?")
+    .all(sessionId, limit) as unknown as JournalRow[];
 }
 
 /** D-FU-GCH-2: true when this worktree holds at least one journal row written by this agent. */

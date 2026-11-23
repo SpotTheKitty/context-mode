@@ -4,6 +4,10 @@ Build server-http.mjs, hook-http.mjs and import.mjs with node build/build-http.m
 
 The stdio entry retains its original schema and operation. HTTP stores tenant/project-scoped journal, sources, metadata and FTS rows in one SQLite database. A native one-shot hook posts its payload and tenant header to the shared server. Transport timeout, connection errors, non-success status and malformed responses return the selected adapter's allow encoding with exit zero, append one JSON line to dataDir/hook-errors.log and emit one stderr line. The table supplies hookTimeoutMs; successful server decisions retain their native encoding. The listener supports _workspace and _sessionId tool arguments or corresponding request metadata. Machine-wide doctor and upgrade operations use stdio.
 
+## Turn-boundary recall (T1173)
+
+After compaction, the UserPromptSubmit hook ranks the asking session's journal rows and indexed line units against the current prompt. Both queries constrain the session ID before ranking. Explicit ctx_search calls can search a worktree or project.
+
 # Bounded search (T230)
 
 A ctx_search never holds the shared server. node:sqlite is synchronous, so a long statement run on the request path stops the one event loop: /healthz and every other tenant waited with it (up to 18 s on the 333 MB store, with single searches of 1 to 106 s). Two causes, both in the tenant-scoped views of src/core/store/tenant-store.ts:
