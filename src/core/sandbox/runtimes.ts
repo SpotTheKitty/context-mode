@@ -7,6 +7,14 @@ import { CtxError } from "../contracts/errors.ts";
 import { pathEntries } from "./path-entries.ts";
 
 const PATHEXT_SEPARATOR = ";";
+
+/** Windows workers copy the environment into a case-sensitive object. */
+function runtimeEnvValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const value = env[name];
+  if (value !== undefined || !isWin()) return value;
+  const key = Object.keys(env).find((entry) => entry.toUpperCase() === name);
+  return key === undefined ? undefined : env[key];
+}
 // DEVIATIONS D-M2-R3-2: the only files Windows CreateProcess starts with shell:false. Node refuses
 // .bat/.cmd without a shell (EINVAL), so a PATHEXT hit on them is not a runtime. An extensionless
 // file is a `#!/bin/sh` shim (pyenv-win, #1208/#1209); runProcess starts it through sh.exe.
@@ -68,9 +76,9 @@ function isRunnable(full: string): boolean {
 export function findRuntime(lang: string, env: NodeJS.ProcessEnv = process.env): string | null {
   if (isWin() && WIN_SHELL_LANGS.includes(lang)) return findGitBash(env);
   // W-CODEX-6: a Windows PATH entry may be wrapped in double quotes; the shared helper cuts them off.
-  const dirs = pathEntries(env.PATH ?? "", process.platform, path.delimiter);
+  const dirs = pathEntries(runtimeEnvValue(env, "PATH") ?? "", process.platform, path.delimiter);
   const pathExt = isWin()
-    ? (env.PATHEXT ?? PATHEXT_DEFAULT).split(PATHEXT_SEPARATOR).filter((e) => e !== "")
+    ? (runtimeEnvValue(env, "PATHEXT") ?? PATHEXT_DEFAULT).split(PATHEXT_SEPARATOR).filter((e) => e !== "")
     : [];
   const names = candidates(lang);
   let shim: string | null = null;
