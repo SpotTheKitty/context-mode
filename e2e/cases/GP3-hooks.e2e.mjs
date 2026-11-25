@@ -223,8 +223,8 @@ import { DatabaseSync } from "node:sqlite";
   }
 
   // D-FU-OI-KIRO-1: Kiro CLI V3 SessionStart, payload shape from https://kiro.dev/docs/hooks/types/ (read 2026-10-23).
-  // Fresh git repo and temp HOME. Documented contract: exit 0 stdout goes to the agent context. First call of a
-  // session id prints the resume line; the same id again prints nothing (once per session, not a failure).
+  // Fresh git repo and temp HOME. Exit 0 stdout goes to the agent context. A session with
+  // journal history gets the line once. Fresh session ids get empty stdout.
   test("[M3] GP3/kiro-sessionstart-prints-once", async () => {
     const { mkdtempSync, mkdirSync, realpathSync, rmSync } = await import("node:fs");
     const { execFileSync } = await import("node:child_process");
@@ -240,6 +240,11 @@ import { DatabaseSync } from "node:sqlite";
       assert.ok(fx, "no recorded e2e/fixtures/kiro/<ver>/SessionStart.json");
       const payload = { ...JSON.parse(readFileSync(fx.filePath, "utf8")), cwd: proj, session_id: "gp3-kiro-session-1" };
       const env = { PATH: process.env.PATH, HOME: home, USERPROFILE: home };
+      const cold = await runHookFixture(HOOK_BUNDLE, "kiro", payload, env);
+      const prompt = await runHookFixture(HOOK_BUNDLE, "kiro", {
+        ...payload, hook_event_name: "UserPromptSubmit", prompt: "Earlier work",
+      }, env);
+      assert.equal(prompt.exitCode, 0, prompt.stderr);
       const first = await runHookFixture(HOOK_BUNDLE, "kiro", payload, env);
       const second = await runHookFixture(HOOK_BUNDLE, "kiro", payload, env);
       const other = await runHookFixture(HOOK_BUNDLE, "kiro", { ...payload, session_id: "gp3-kiro-session-2" }, env);
@@ -247,7 +252,8 @@ import { DatabaseSync } from "node:sqlite";
       const noSid = await runHookFixture(HOOK_BUNDLE, "kiro", { hook_event_name: "SessionStart", cwd: proj }, env);
       const shape = (r) => ({ exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr });
       checkGolden("GP3", "kiro-sessionstart-prints-once", normalize({
-        first: shape(first), sameSessionAgain: shape(second), newSession: shape(other), legacyAgentSpawn: shape(legacy), noSessionId: shape(noSid),
+        cold: shape(cold), first: shape(first), sameSessionAgain: shape(second),
+        newSession: shape(other), legacyAgentSpawn: shape(legacy), noSessionId: shape(noSid),
       }, { home, proj }));
     } finally {
       rmSync(root, { recursive: true, force: true });

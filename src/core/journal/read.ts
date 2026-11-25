@@ -50,12 +50,7 @@ export function readRecallRows(db: DbHandle, sessionId: string, limit: number): 
     .all(sessionId, limit) as unknown as JournalRow[];
 }
 
-/** D-FU-GCH-2: true when this worktree holds at least one journal row written by this agent. */
-export function hasAgentRows(db: DbHandle, worktree: string, agent: string): boolean {
-  return db.raw.prepare("SELECT 1 FROM events WHERE worktree = ? AND agent = ? LIMIT 1").get(worktree, agent) !== undefined;
-}
-
-/** D-FU-GCH-2: true when this session already holds a journal row (so this is not its first turn). */
+/** Whether a resume lookup has at least one journal row for this session. */
 export function hasSessionRows(db: DbHandle, sessionId: string): boolean {
   return db.raw.prepare("SELECT 1 FROM events WHERE session_id = ? LIMIT 1").get(sessionId) !== undefined;
 }

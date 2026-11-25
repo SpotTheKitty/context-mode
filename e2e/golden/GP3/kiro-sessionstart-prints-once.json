@@ -1,4 +1,9 @@
 {
+  "cold": {
+    "exitCode": 0,
+    "stdout": "",
+    "stderr": ""
+  },
   "first": {
     "exitCode": 0,
     "stdout": "This session may have run before. Call mcp_context_mode_ctx_resume for a summary of what happened.",
@@ -11,12 +16,12 @@
   },
   "newSession": {
     "exitCode": 0,
-    "stdout": "This session may have run before. Call mcp_context_mode_ctx_resume for a summary of what happened.",
+    "stdout": "",
     "stderr": ""
   },
   "legacyAgentSpawn": {
     "exitCode": 0,
-    "stdout": "This session may have run before. Call mcp_context_mode_ctx_resume for a summary of what happened.",
+    "stdout": "",
     "stderr": ""
   },
   "noSessionId": {

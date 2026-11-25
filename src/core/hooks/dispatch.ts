@@ -26,7 +26,7 @@ import { claudeDirOf, homeDirOf } from "../project/config-dir.ts";
 import { isInside } from "../project/contain.ts";
 import { metaGet, metaSet, metaTake, openDb } from "../store/db.ts";
 import { appendEvent, canonicalKey } from "../journal/append.ts";
-import { hasAgentRows, hasSessionRows, readLastPrompt, readRecallRows, readSessionEvents } from "../journal/read.ts";
+import { hasSessionRows, readLastPrompt, readRecallRows, readSessionEvents } from "../journal/read.ts";
 import { finishReserved, insertChunks, insertUnits, queryUnits, recallQueryText, reserveSource, sourceHandle, type SourceDraft } from "../store/fts.ts";
 import { buildUnits } from "../index/units.ts";
 import { renderState } from "../compaction/render.ts";
@@ -163,22 +163,25 @@ async function sessionStart(ev: CanonicalHookEvent, row: AdapterRow, project: Pr
     if (!shouldHint(db, ev.sessionId, COMPACT_STATE_KEY)) return ALLOW;
     return { kind: "hint", text: compactText(db, ev, row), onceKey: COMPACT_STATE_KEY };
   }
-  const db = await openDb(project);
-  // impl/12 §4.6 step 2, D-M5-P2-4: the OpenCode plugin's one `context` call per session reads and clears
-  // the pending-compact marker here (handleHook is the one DB path); its stdout is the cache-stable payload.
-  if (row.compactDelivery === "opencode-cache" && metaTake(db, PENDING_COMPACT_META_PREFIX + ev.sessionId) !== null) {
-    return { kind: "hint", text: compactText(db, ev, row), onceKey: PENDING_COMPACT_KEY };
+  try {
+    const db = await openDb(project);
+    // impl/12 §4.6 step 2, D-M5-P2-4: the OpenCode plugin's one `context` call per session reads and clears
+    // the pending-compact marker here (handleHook is the one DB path); its stdout is the cache-stable payload.
+    if (row.compactDelivery === "opencode-cache" && metaTake(db, PENDING_COMPACT_META_PREFIX + ev.sessionId) !== null) {
+      return { kind: "hint", text: compactText(db, ev, row), onceKey: PENDING_COMPACT_KEY };
+    }
+    if (!ev.sessionId || !hasSessionRows(db, ev.sessionId) || !shouldHint(db, ev.sessionId, RESUME_HINT_KEY)) return ALLOW;
+    return { kind: "hint", text: withPrefix(RESUME_HINT, row), onceKey: RESUME_HINT_KEY };
+  } catch {
+    // Startup can continue without a journal hint when the store is unavailable.
+    return ALLOW;
   }
-  if (!shouldHint(db, ev.sessionId, RESUME_HINT_KEY)) return ALLOW;
-  return { kind: "hint", text: withPrefix(RESUME_HINT, row), onceKey: RESUME_HINT_KEY }; // D-M3-H2-2
 }
 
 // ---------- §4.4 UserPromptSubmit ----------
 
 async function userPromptSubmit(ev: CanonicalHookEvent, row: AdapterRow, project: ProjectContext): Promise<Decision> {
   const body = ev.prompt ?? "";
-  // D-FU-GCH-2: decided before this turn's own prompt row is queued, so that row never counts as "something to resume".
-  const resume = await firstTurnResume(ev, row, project);
   appendDetached(project, ev.sessionId, {
     session_id: ev.sessionId, worktree: project.worktree, agent: ev.agent, kind: "prompt", tool: null, key: null,
     path: null, ok: 1, exit_code: null, bytes: Buffer.byteLength(body), body, turn: ev.turn ?? 0,
@@ -192,22 +195,7 @@ async function userPromptSubmit(ev: CanonicalHookEvent, row: AdapterRow, project
       return { kind: "hint", text: compactText(db, ev, row), onceKey: PENDING_COMPACT_KEY };
     }
   }
-  if (resume !== null) return resume;
   return recall(ev, row, project, body);
-}
-
-// D-FU-GCH-2: a row with no SessionStart hook (Gemini: hooks/hooks.json drops it, D-FU-GCH-1) gets the
-// resume hint on the first UserPromptSubmit of a session instead. First turn = the payload session id has
-// no journal row yet (a host-resumed session keeps its id and its rows, and the host replays that history
-// itself). The marker is the SessionStart one (RESUME_HINT_KEY, same session id), so the hint fires at most
-// once per session. It fires only when this worktree already holds a journal row of this agent.
-async function firstTurnResume(ev: CanonicalHookEvent, row: AdapterRow, project: ProjectContext): Promise<Decision | null> {
-  if (row.eventMap.SessionStart !== undefined || ev.sessionId === "") return null;
-  const db = await openDb(project);
-  if (hasSessionRows(db, ev.sessionId)) return null;
-  if (!shouldHint(db, ev.sessionId, RESUME_HINT_KEY)) return null;
-  if (!hasAgentRows(db, project.worktree, ev.agent)) return null;
-  return { kind: "hint", text: withPrefix(RESUME_HINT, row), onceKey: RESUME_HINT_KEY };
 }
 
 // ---------- DECISIONS-r11 (B) turn-boundary recall ----------

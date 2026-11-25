@@ -138,16 +138,48 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
     assert.deepEqual(out, { stdout: "", exitCode: 0 });
   });
 
-  test("SessionStart startup: resume hint once per session (GP3/hint-once-per-session)", async () => {
-    const p = cc({ hook_event_name: "SessionStart", source: "startup" });
-    const first = parsed(await handleHook("claude-code", p, env));
-    assert.ok(first.additionalContext.includes("mcp__plugin_context-mode_context-mode__ctx_resume"));
-    assert.equal(await handleHook("claude-code", p, env).then((o) => o.stdout), "");
+  // Codex 0.156.1 lifecycle stdin captured by scripts/record-fixtures.mjs.
+  const codexFixture = (event) => JSON.parse(readFileSync(
+    new URL(`../e2e/fixtures/codex/0.156.1/${event}.json`, import.meta.url), "utf8",
+  ));
+
+  test("SessionStart startup: a fresh session gets no hint, even with another session's history", async () => {
+    const earlier = { ...codexFixture("UserPromptSubmit"), cwd: repo, session_id: "earlier-codex-session" };
+    await handleHook("codex", earlier, env);
+    assert.equal((await waitRows("SELECT seq FROM events WHERE session_id = ?", [earlier.session_id], 1)).length, 1);
+    const start = { ...codexFixture("SessionStart"), cwd: repo, session_id: "fresh-codex-session" };
+    assert.equal(parsed(await handleHook("codex", start, env)), null);
   });
 
-  test("GP6/hint-names-platform-tool: Codex resume hint names mcp__context_mode__ctx_resume", async () => {
-    const out = await handleHook("codex", cc({ hook_event_name: "SessionStart", source: "startup" }), env);
-    assert.ok(parsed(out).additionalContext.includes("mcp__context_mode__ctx_resume"));
+  test("SessionStart resume: same-session history enables the Codex hint once", async () => {
+    const start = { ...codexFixture("SessionStart"), cwd: repo, session_id: "resumed-codex-session" };
+    assert.equal(parsed(await handleHook("codex", start, env)), null);
+    await handleHook("codex", {
+      ...codexFixture("UserPromptSubmit"), cwd: repo, session_id: start.session_id,
+    }, env);
+    assert.equal((await waitRows("SELECT seq FROM events WHERE session_id = ?", [start.session_id], 1)).length, 1);
+    start.source = "resume";
+    const out = parsed(await handleHook("codex", start, env));
+    assert.ok(out.additionalContext.includes("mcp__context_mode__ctx_resume"));
+    assert.equal(parsed(await handleHook("codex", start, env)), null);
+  });
+
+  test("SessionStart resume: unreachable store gives no hint or hook error", async () => {
+    const cwd = join(root, "blocked-repo");
+    mkdirSync(cwd);
+    execFileSync("git", ["init", "-q", cwd]);
+    const project = resolveProject("codex", { env, argv: [], cwd });
+    mkdirSync(path.dirname(project.projectDir), { recursive: true });
+    writeFileSync(project.projectDir, "a file where the store directory should be");
+    const cap = captureStderr();
+    try {
+      const start = { ...codexFixture("SessionStart"), cwd, session_id: "blocked-session", source: "resume" };
+      assert.equal(parsed(await handleHook("codex", start, env)), null);
+      assert.deepEqual(cap.lines, []);
+    } finally {
+      cap.restore();
+      rmSync(project.projectDir);
+    }
   });
 
   test("SessionStart compact on claude-code (compactSummary none, D-M7-CL-1): the renderState block, not the pointer", async () => {
@@ -157,7 +189,7 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
   });
 
   test("SessionStart compact on codex (compactSummary none): the renderState block, not the pointer (M4, D-M4-H2-4)", async () => {
-    const out = await handleHook("codex", cc({ hook_event_name: "SessionStart", source: "compact" }), env);
+    const out = await handleHook("codex", { ...codexFixture("SessionStart"), cwd: repo, session_id: "compact-codex-session", source: "compact" }, env);
     const text = parsed(out).additionalContext;
     assert.ok(text.startsWith("<context_mode_state ") && text !== COMPACT_POINTER_LINE, text);
   });
@@ -1715,32 +1747,36 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
   });
 
   // D-FU-OI-KIRO-1: Kiro CLI V3 SessionStart (https://kiro.dev/docs/hooks/types/, read 2026-10-23): payload
-  // hook_event_name, cwd, session_id; exit 0 stdout is added to the agent's context. The hook prints the resume
-  // line once per session id (E5, A20): empty stdout is the right answer for a repeat or a payload without session_id.
+  // hook_event_name, cwd, session_id; exit 0 stdout is added to the agent's context.
   const KIRO_RESUME = "This session may have run before. Call mcp_context_mode_ctx_resume for a summary of what happened.";
 
-  test("kiro SessionStart: first call of a session prints the resume line with the kiro tool prefix, exit 0", () => {
+  test("kiro SessionStart: a fresh session prints nothing and exits 0", () => {
     const p = { hook_event_name: "SessionStart", cwd: repo, session_id: "kiro-ss-1" };
     const r = run(["--agent", "kiro"], JSON.stringify(p));
     assert.equal(r.status, 0);
-    assert.equal(r.stdout, KIRO_RESUME);
+    assert.equal(r.stdout, "");
     assert.equal(r.stderr, "");
   });
 
   test("kiro SessionStart: same session id again prints nothing (once per session, not a failure)", () => {
     const p = { hook_event_name: "SessionStart", cwd: repo, session_id: "kiro-ss-2" };
+    const prompt = run(["--agent", "kiro"], JSON.stringify({ ...p, hook_event_name: "UserPromptSubmit", prompt: "Earlier work" }));
+    assert.equal(prompt.status, 0, prompt.stderr);
     assert.equal(run(["--agent", "kiro"], JSON.stringify(p)).stdout, KIRO_RESUME);
     const again = run(["--agent", "kiro"], JSON.stringify(p));
     assert.equal(again.status, 0);
     assert.equal(again.stdout, "");
     assert.equal(again.stderr, "");
     const other = run(["--agent", "kiro"], JSON.stringify({ ...p, session_id: "kiro-ss-3" }));
-    assert.equal(other.stdout, KIRO_RESUME);
+    assert.equal(other.stdout, "");
   });
 
-  test("kiro SessionStart: legacy agentSpawn prints the same line; no session_id prints nothing (E5)", () => {
+  test("kiro SessionStart: legacy agentSpawn and missing session id both allow without fresh history", () => {
     const spawn = { hook_event_name: "agentSpawn", cwd: repo, session_id: "kiro-ss-4" };
-    assert.equal(run(["--agent", "kiro"], JSON.stringify(spawn)).stdout, KIRO_RESUME);
+    const legacy = run(["--agent", "kiro"], JSON.stringify(spawn));
+    assert.equal(legacy.status, 0);
+    assert.equal(legacy.stdout, "");
+    assert.equal(legacy.stderr, "");
     const none = run(["--agent", "kiro"], JSON.stringify({ hook_event_name: "SessionStart", cwd: repo }));
     assert.equal(none.status, 0);
     assert.equal(none.stdout, "");

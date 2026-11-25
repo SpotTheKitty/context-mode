@@ -79,7 +79,7 @@ export async function handleHook(agent: AgentId, raw: unknown, env: NodeJS.Proce
    3. `rows = readSessionEvents(db, ev.sessionId)`; `text = renderState(rows, ev.turn ?? 0)` (tools-session export, 00 §4; proves GP6); `decision = { kind: "hint", text, onceKey: "compact-state" }` — the full 2,048 B block (D1 algorithm, unchanged), delivered through this agent's existing ADR-0009 §6 `sessionstart` path.
    4. `onceKey` is set in both branches so a second `SessionStart(compact)` inside the same session id (should not happen per ADR-0009 "exactly once") would still be throttled by §2 if it somehow fired twice (Assumption A23: ADR-0009 says "once" but does not say what guards a duplicate event; reusing the throttle marker is the one mechanism this module already owns).
    5. Go to §4.2 step 6.
-2. Else (`ev.source` is `"startup" | "resume" | "clear"`, or this agent's delivery is not `sessionstart`): `fire = shouldHint(db, ev.sessionId, "resume-hint")` (requires `openDb` first; if `openDb` throws `DB_GONE`, treat as `fire = false`, no hint — step 3 of §4.2 already caught non-project cases, this catches a DB that vanished after project resolution).
+2. For generic resume delivery, open the store and check for a journal row for `ev.sessionId`. Only then call `shouldHint(db, ev.sessionId, "resume-hint")`. Allow startup silently if the store cannot be read.
 3. `if (fire)`: `decision = { kind: "hint", text: "This session may have run before. Call ctx_resume for a summary of what happened.", onceKey: "resume-hint" }`. Else `decision = { kind: "allow" }`.
 4. No journal row is written for `SessionStart` (it is read-only against the journal; PRD §10.1 lists its job as "journal hint; ctx_resume hint" — hint, not write).
 

@@ -52,8 +52,9 @@ function fixture(t) {
   const home = mkdtempSync(path.join(tmpdir(), "cm-gp6-home-"));
   const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_PROJECT_DIR: repo };
   const clients = [];
-  t.after(() => {
-    for (const c of clients) c.kill();
+  t.after(async () => {
+    // Wait for SQLite handles to close before deleting the fixture on Windows.
+    await Promise.all(clients.map((c) => c.close()));
     rmSync(repo, { recursive: true, force: true });
     rmSync(home, { recursive: true, force: true });
   });
@@ -361,18 +362,16 @@ test("[M4] GP6/no-resume-hint-mid-session", async (t) => {
   assert.equal(await f.hook("gemini", "gp6-mid-g", { hook_event_name: "BeforeAgent", prompt: "hi" }), null);
 });
 
-// D-FU-GCH-2: Gemini has no SessionStart hook (D-FU-GCH-1), so the resume hint rides the first BeforeAgent of a
-// session, once, keyed by the payload session id, and only when this worktree already holds a Gemini journal row.
-test("[M4] GP6/gemini-resume-hint-first-turn-only", async (t) => {
+// Gemini's BeforeAgent must never mistake another session's journal for its own.
+test("[M4] GP6/gemini-no-resume-hint-from-other-sessions", async (t) => {
   const f = fixture(t);
-  const HINT = "This session may have run before. Call mcp_context-mode_ctx_resume for a summary of what happened.";
   const turn = (sid, prompt) => f.hook("gemini", sid, { hook_event_name: "BeforeAgent", prompt });
   assert.equal(await turn("gp6-g-seed", "first ever prompt"), null, "nothing to resume: no hint");
   assert.equal(await turn("gp6-g-seed", "second prompt"), null, "mid-session: no hint");
-  assert.equal(await turn("gp6-g-one", "pick up the work"), HINT, "new session, rows to resume: first turn gets the hint");
+  assert.equal(await turn("gp6-g-one", "pick up the work"), null, "new session: another session's rows do not count");
   assert.equal(await turn("gp6-g-one", "go on"), null, "second turn of the same session: no hint");
   assert.equal(await turn("gp6-g-one", "and on"), null, "third turn of the same session: no hint");
-  assert.equal(await turn("gp6-g-two", "again"), HINT, "another new session: first turn gets the hint");
+  assert.equal(await turn("gp6-g-two", "again"), null, "another new session: no hint");
   assert.equal(await turn("gp6-g-two", "more"), null, "its second turn: no hint");
 });
 

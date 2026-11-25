@@ -88,7 +88,7 @@ Note (DECISIONS-r9 V9): Claude Code's `compactSummary: "host"` row stays `"host"
 |---|---|---|---|---|---|
 | `claude-code` | `SessionStart` | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` | — (source=`compact` on SessionStart) |
 | `codex` | `SessionStart` | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` | — (source on SessionStart) |
-| `gemini` | — (dropped, D-FU-GCH-1; resume hint on the first `BeforeAgent` of a session, D-FU-GCH-2) | `BeforeAgent` | `BeforeTool` | `AfterTool` | `PreCompress` |
+| `gemini` | — (dropped, D-FU-GCH-1) | `BeforeAgent` | `BeforeTool` | `AfterTool` | `PreCompress` |
 | `qwen` | `SessionStart` | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` | — (source on SessionStart) |
 | `copilot-cli` | `sessionStart` | `userPromptSubmitted` | `preToolUse` | `postToolUse` | — (no PreCompact hook; substitute is the next `userPromptSubmitted`/`preToolUse`) |
 | `vscode` | `SessionStart` | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` | — (no PreCompact hook; substitute is the next `UserPromptSubmit`) |
@@ -97,7 +97,7 @@ Note (DECISIONS-r9 V9): Claude Code's `compactSummary: "host"` row stays `"host"
 | `pi` | `session_start` (compact: `session_compact`) | `input` | `tool_call` | `tool_result` | — (`session_compact` event covers it) |
 | `opencode` | session hook `context` | session hook `prompt` | `execute.before` | `execute.after` | session hook `compaction` |
 
-First-turn resume hint (D-FU-GCH-2): a row whose `eventMap` has no `SessionStart` gets the resume hint from `UserPromptSubmit` instead. It fires when all of these hold: the payload session id has no journal row yet (first turn), the `resume-hint` marker for that session is unused (`shouldHint`, once per session), and the worktree already holds a journal row of this agent (something to resume). The check runs before the turn's own prompt row is queued. A later turn of the same session never gets it (GP6/no-resume-hint-mid-session, GP6/gemini-resume-hint-first-turn-only).
+The generic resume hint is delivered by `SessionStart` when the current session has journal history. Gemini's `BeforeAgent` records the prompt and can deliver pending compaction state.
 
 Template hook files: `hooks/codex.json`, `hooks/vscode.json` and `hooks/copilot-cli.json` are templates. These hosts have no documented plugin-root variable, so the commands hold the bare `node hook.mjs` form; the install docs one-line writer fills the absolute path (D-FU-RM-TEMPLATES-1). Do not copy them by hand.
 
